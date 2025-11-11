@@ -1,0 +1,18 @@
+[project]
+name = "gupo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.11.0",
+    "datasets>=4.4.1",
+    "deepspeed>=0.18.2",
+    "numpy>=1.26.4",
+    "omegaconf>=2.3.0",
+    "pandas>=2.3.3",
+    "torch==2.5.1",
+    "transformers==4.57.1",
+    "trl>=0.25.0",
+    "vllm>=0.7.3",
+]
