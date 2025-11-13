@@ -17,7 +17,6 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.api import FullStateDictConfig, FullOptimStateDictConfig
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-import tensor_parallel as tp
 
 from preference_datasets import get_batch_iterator
 from utils import (
@@ -35,14 +34,11 @@ import tqdm
 
 import random
 import os
-import math
 from collections import defaultdict
 import time
 import json
 import functools
 from typing import Optional, Dict, List, Union, Tuple
-
-import cvxpy as cp
 
 def stabilized_log1pexp(x):
     """
@@ -85,7 +81,6 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
     losses = -F.logsigmoid(beta * logits)
     chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
     rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-    print(losses.shape)
 
     return losses, chosen_rewards, rejected_rewards
 
@@ -198,52 +193,6 @@ def alpha_dpo_loss(policy_chosen_logps: torch.FloatTensor,
     rejected_rewards = beta * (pi_ref_rejected_probratios).detach()
     return losses, chosen_rewards, rejected_rewards
 
-def gupo_loss(policy_chosen_logps: torch.FloatTensor,
-             policy_rejected_logps: torch.FloatTensor,
-             reference_chosen_logps: torch.FloatTensor,
-             reference_rejected_logps: torch.FloatTensor,
-             beta: float,
-             beta_chosen: torch.FloatTensor,
-             beta_rejected: torch.FloatTensor,
-             rho: float = 0) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the DPO loss for a batch of policy and reference model log probabilities.
-    
-    Args:
-        policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-        policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-        reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-        reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
-
-    Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
-        The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
-    """
-    
-    pi_logratios = policy_chosen_logps - policy_rejected_logps
-    ref_logratios = reference_chosen_logps - reference_rejected_logps
-    gamma = 0.5772156649
-
-    logits = pi_logratios - ref_logratios
-    
-    delta_V = beta * logits
-    mu = gamma * (beta_chosen - beta_rejected)
-    std = torch.sqrt((math.pi**2 / 6) * (beta_chosen**2 + beta_rejected**2 - 2 * rho * beta_chosen * beta_rejected))
-    z = (delta_V - mu) / std
-    losses = - torch.special.log_ntdr(z)
-    
-    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
-    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
-    
-    
-    
-    print(losses.shape)
-    
-
-    return losses, chosen_rewards, rejected_rewards
-
 
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
     """Compute the log probabilities of the given labels under the given logits.
@@ -346,10 +295,6 @@ class BasicTrainer(object):
             elif config.loss.divergence == 'alpha_divergence':
                 assert config.loss.alpha > 0 and config.loss.alpha < 1, f'alpha must be in (0, 1), got {config.loss.alpha}'
                 self._loss_fn = partial(alpha_dpo_loss, alpha=config.loss.alpha)
-            elif config.loss.divergence == 'gupo':
-                self._loss_fn = gupo_loss
-                self.mlp = nn.Linear()
-                
             else:
                 raise ValueError(f'Unknown divergence {config.loss.divergence}')
             
@@ -534,7 +479,6 @@ class BasicTrainer(object):
             examples_per_second = self.config.batch_size / step_time
             batch_metrics['examples_per_second'].append(examples_per_second)
             batch_metrics['grad_norm'].append(grad_norm)
-            batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
 
             self.batch_counter += 1
             self.example_counter += self.config.batch_size
@@ -673,28 +617,3 @@ class FSDPTrainer(BasicTrainer):
             scheduler_state_dict = self.scheduler.state_dict()
             self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
         dist.barrier()
-        
-
-class TensorParallelTrainer(BasicTrainer):
-    def __init__(self, policy, config, seed, run_dir, reference_model=None, rank=0, world_size=1):
-        """A trainer subclass that uses TensorParallel to shard the model across multiple GPUs.
-
-           Based on https://github.com/BlackSamorez/tensor_parallel. Note sampling is extremely slow,
-              see https://github.com/BlackSamorez/tensor_parallel/issues/66.
-        """
-        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size)
-        
-        rank0_print('Sharding policy...')
-        self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name == 'dpo':
-            rank0_print('Sharding reference model...')
-            self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
-
-    def save(self, output_dir=None, metrics=None):
-        """Save (unsharded) policy state to disk."""
-        with tp.save_tensor_parallel(self.policy):
-            policy_state_dict = self.policy.state_dict()
-    
-        self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
-        del policy_state_dict
-        

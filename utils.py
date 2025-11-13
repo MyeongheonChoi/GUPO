@@ -37,13 +37,23 @@ def rank0_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def get_local_dir(prefixes_to_resolve: List[str]) -> str:
-    """Return the path to the cache directory for this user."""
-    for prefix in prefixes_to_resolve:
-        if os.path.exists(prefix):
-            return f"{prefix}/{getpass.getuser()}"
-    os.makedirs(prefix)
-    return f"{prefix}/{getpass.getuser()}"
+# def get_local_dir(prefixes_to_resolve: List[str]) -> str:
+#     """Return the path to the cache directory for this user."""
+#     for prefix in prefixes_to_resolve:
+#         if os.path.exists(prefix):
+#             return f"{prefix}/{getpass.getuser()}"
+#     os.makedirs(prefix)
+#     return f"{prefix}/{getpass.getuser()}"
+
+def get_local_dir(prefixes_to_resolve: list[str]) -> str:
+    """Return the first existing dir; if none, create the last one and return it."""
+    for p in prefixes_to_resolve:
+        if os.path.isdir(p):
+            return p
+    target = prefixes_to_resolve[-1]
+    os.makedirs(target, exist_ok=True)
+    return target
+
     
 
 def get_local_run_dir(exp_name: str, local_dirs: List[str]) -> str:

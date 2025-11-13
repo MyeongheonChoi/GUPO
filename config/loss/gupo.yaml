@@ -1,0 +1,13 @@
+# do DPO preference-based training
+name: gupo
+
+# the temperature parameter for DPO; lower values mean we care less about
+#   the reference model
+beta_dpo: 0.9
+
+# if true, use a uniform (maximum entropy) reference model
+reference_free: false
+
+rho: 0
+
+mlp_reg_lambda: 0.005
