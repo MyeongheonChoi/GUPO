@@ -76,7 +76,8 @@ def gupo_loss(policy_chosen_logps: torch.FloatTensor,
     # delta_V = 5 * torch.tanh(logits / 5) # scale to (-5, 5)
     mu = gamma * (beta_rejected - beta_chosen)
     std_squared = (math.pi**2 / 6) * (beta_chosen**2 + beta_rejected**2 - 2 * rho * beta_chosen * beta_rejected)
-    std = torch.sqrt(torch.clamp(std_squared, min=1e-8))
+    std = torch.sqrt(std_squared)
+    # std = torch.sqrt(torch.clamp(std_squared, min=1e-8))
     z = (delta_V - mu) / std
     losses = - torch.special.log_ndtr(z)
     
@@ -174,11 +175,10 @@ class BasicTrainer(object):
         self.policy = policy
         self.reference_model = reference_model
         self.mlp = nn.Sequential(
-            nn.LayerNorm(self.policy.config.hidden_size),
             nn.Linear(self.policy.config.hidden_size, self.policy.config.hidden_size // 4),
             nn.GELU(),
             nn.Linear(self.policy.config.hidden_size // 4, 1),
-            nn.Sigmoid()
+            nn.Softplus()
             ).to(self.policy.device)
 
         if config.loss.initial_joint:
@@ -248,8 +248,9 @@ class BasicTrainer(object):
             mean_pooled_embeddings = sum_hidden_states / num_tokens  # (batch_size * 2, hidden_size)
             
             # print(mean_pooled_embeddings)
-            all_betas_raw = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
-            all_betas = all_betas_raw * 9.9 + 0.1  # scale to (0.1, 10.0)
+            # all_betas_raw = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
+            all_betas = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
+            # all_betas = all_betas_raw * 9.9 + 0.1  # scale to (0.1, 10.0)
             chosen_betas = all_betas[:batch['chosen_input_ids'].shape[0]]
             rejected_betas = all_betas[batch['chosen_input_ids'].shape[0]:]
 
