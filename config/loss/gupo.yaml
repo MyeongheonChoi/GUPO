@@ -11,3 +11,5 @@ reference_free: false
 rho: 0
 
 mlp_reg_lambda: 0.005
+
+initial_joint: true

@@ -8,9 +8,6 @@ beta: 0.9
 # if true, use a uniform (maximum entropy) reference model
 reference_free: false
 
-# divergence type; currently only "kl, reverse kl and jsd" are supported
-divergence: reverse_kl
-
 # if use alpha divergence, we need to specify alpha
 alpha: 0
 

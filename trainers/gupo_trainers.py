@@ -72,8 +72,8 @@ def gupo_loss(policy_chosen_logps: torch.FloatTensor,
 
     logits = pi_logratios - ref_logratios
     
-    # delta_V = beta * logits
-    delta_V = 5 * torch.tanh(logits / 5) # scale to (-5, 5)
+    delta_V = beta * logits
+    # delta_V = 5 * torch.tanh(logits / 5) # scale to (-5, 5)
     mu = gamma * (beta_rejected - beta_chosen)
     std_squared = (math.pi**2 / 6) * (beta_chosen**2 + beta_rejected**2 - 2 * rho * beta_chosen * beta_rejected)
     std = torch.sqrt(torch.clamp(std_squared, min=1e-8))
@@ -181,16 +181,18 @@ class BasicTrainer(object):
             nn.Sigmoid()
             ).to(self.policy.device)
 
-        # self.train_iterator = get_batch_iterator(
-        #     **self.data_iterator_kwargs, 
-        #     split='train', 
-        #     n_epochs=config.n_epochs, 
-        #     n_examples=config.n_examples, 
-        #     batch_size=config.batch_size, 
-        #     silent=rank != 0, 
-        #     cache_dir=get_local_dir(config.local_dirs)
-        # )
-        # rank0_print(f'Loaded train data iterator')
+        if config.loss.initial_joint:
+            self.train_iterator = get_batch_iterator(
+                **self.data_iterator_kwargs, 
+                split='train', 
+                n_epochs=config.n_epochs, 
+                n_examples=config.n_examples, 
+                batch_size=config.batch_size, 
+                silent=rank != 0, 
+                cache_dir=get_local_dir(config.local_dirs)
+            )
+            rank0_print(f'Loaded train data iterator')
+
         self.eval_iterator = get_batch_iterator(
             **self.data_iterator_kwargs, 
             split='test', 
@@ -362,21 +364,149 @@ class BasicTrainer(object):
         self.batch_counter = 0
         last_log = None
         
-        for epoch in range(1, self.config.n_epochs + 1):
-            rank0_print(f'===== Starting epoch {epoch}/{self.config.n_epochs} =====')
-            
-            epoch_train_iterator = get_batch_iterator(
-                **self.data_iterator_kwargs,
-                split = 'train',
-                n_epochs = 1,
-                n_examples = self.config.n_examples,
-                batch_size = self.config.batch_size,
-                silent = self.rank != 0,
-                cache_dir = get_local_dir(self.config.local_dirs)
-            )
-            
-            for batch in epoch_train_iterator:
+        if not self.config.loss.initial_joint:
+            for epoch in range(1, self.config.n_epochs + 1):
+                rank0_print(f'===== Starting epoch {epoch}/{self.config.n_epochs} =====')
                 
+                epoch_train_iterator = get_batch_iterator(
+                    **self.data_iterator_kwargs,
+                    split = 'train',
+                    n_epochs = 1,
+                    n_examples = self.config.n_examples,
+                    batch_size = self.config.batch_size,
+                    silent = self.rank != 0,
+                    cache_dir = get_local_dir(self.config.local_dirs)
+                )
+                
+                for batch in epoch_train_iterator:
+                    
+                    #### BEGIN EVALUATION ####
+                    if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                        rank0_print(f'Running evaluation after {self.example_counter} train examples')
+                        self.policy.eval()
+                        self.mlp.eval()
+
+                        all_eval_metrics = defaultdict(list)
+                        if self.config.sample_during_eval:
+                            all_policy_samples, all_reference_samples = [], []
+                            policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+                            if self.config.loss.name == 'gupo':
+                                reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+
+                        for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
+                            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                            with torch.no_grad():
+                                _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+
+                            for k, v in eval_metrics.items():
+                                all_eval_metrics[k].extend(v)
+
+                            if self.config.sample_during_eval:
+                                if 'FSDP' in self.config.trainer:
+                                    with FSDP.summon_full_params(self.policy, writeback=False, recurse=False):
+                                        policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+                                else:
+                                    policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+
+                                all_policy_samples.extend(policy_samples)
+                                all_reference_samples.extend(reference_samples)
+
+                                for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                                    policy_text_table.add_data(self.example_counter, prompt, sample)
+                                if self.config.loss.name == 'gupo':
+                                    for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                                        reference_text_table.add_data(self.example_counter, prompt, sample)
+
+                        mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+                        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+                        if self.config.sample_during_eval:                    
+                            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
+                            if self.config.loss.name == 'gupo':
+                                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+
+                        if self.config.wandb.enabled and self.rank == 0:
+                            wandb.log(mean_eval_metrics, step=self.example_counter)
+
+                            if self.config.sample_during_eval:
+                                wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
+                                if self.config.loss.name == 'gupo':
+                                    wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
+
+                        if self.example_counter > 0:
+                            if self.config.debug:
+                                rank0_print('skipping save in debug mode')
+                            else:
+                                output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                                rank0_print(f'creating checkpoint to write to {output_dir}...')
+                                self.save(output_dir, mean_eval_metrics)
+                    #### END EVALUATION ####
+
+                    #### BEGIN TRAINING ####
+                    self.policy.train()
+                    self.mlp.train()
+
+                    start_time = time.time()
+                    batch_metrics = defaultdict(list)
+                    for microbatch_idx in range(self.config.gradient_accumulation_steps):
+                        global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
+                        local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
+                        loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
+                        (loss / self.config.gradient_accumulation_steps).backward()
+
+                        for k, v in metrics.items():
+                            batch_metrics[k].extend(v)
+                    
+                    if epoch == 1:
+                        grad_norm_mlp = self.clip_gradient_mlp()
+                        
+                        self.optimizer_mlp.step()
+                        self.optimizer.zero_grad()
+                        self.optimizer_mlp.zero_grad()
+                        
+                        batch_metrics['grad_norm'].append(0.0)
+                        batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
+                        batch_metrics['lr'].append(0.0)
+                    
+                    else:
+                        grad_norm = self.clip_gradient()
+                        grad_norm_mlp = self.clip_gradient_mlp()
+                        
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer_mlp.step()
+                        self.scheduler_mlp.step()
+                        
+                        self.optimizer.zero_grad()
+                        self.optimizer_mlp.zero_grad()
+
+                        batch_metrics['grad_norm'].append(grad_norm)
+                        batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
+                        batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
+                    
+                    batch_metrics['lr_mlp'].append(self.scheduler_mlp.get_last_lr()[0])
+                    step_time = time.time() - start_time
+                    examples_per_second = self.config.batch_size / step_time
+                    batch_metrics['examples_per_second'].append(examples_per_second)
+                    
+                    self.batch_counter += 1
+                    self.example_counter += self.config.batch_size
+
+                    if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
+                        mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+                        mean_train_metrics['counters/examples'] = self.example_counter
+                        mean_train_metrics['counters/updates'] = self.batch_counter
+                        mean_train_metrics['counters/epoch'] = epoch
+                        rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+
+                        if self.config.wandb.enabled and self.rank == 0:
+                            wandb.log(mean_train_metrics, step=self.example_counter)
+
+                        last_log = time.time()
+                    else:
+                        rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
+                #### END TRAINING ####
+        else:
+            for batch in self.train_iterator:
                 #### BEGIN EVALUATION ####
                 if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
                     rank0_print(f'Running evaluation after {self.example_counter} train examples')
@@ -452,39 +582,24 @@ class BasicTrainer(object):
 
                     for k, v in metrics.items():
                         batch_metrics[k].extend(v)
-                
-                if epoch == 1:
-                    grad_norm_mlp = self.clip_gradient_mlp()
-                    
-                    self.optimizer_mlp.step()
-                    self.optimizer.zero_grad()
-                    self.optimizer_mlp.zero_grad()
-                    
-                    batch_metrics['grad_norm'].append(0.0)
-                    batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-                    batch_metrics['lr'].append(0.0)
-                
-                else:
-                    grad_norm = self.clip_gradient()
-                    grad_norm_mlp = self.clip_gradient_mlp()
-                    
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer_mlp.step()
-                    self.scheduler_mlp.step()
-                    
-                    self.optimizer.zero_grad()
-                    self.optimizer_mlp.zero_grad()
 
-                    batch_metrics['grad_norm'].append(grad_norm)
-                    batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-                    batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
-                
-                batch_metrics['lr_mlp'].append(self.scheduler_mlp.get_last_lr()[0])
+                grad_norm = self.clip_gradient()
+                grad_norm_mlp = self.clip_gradient_mlp()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer_mlp.step()
+                self.scheduler_mlp.step()
+                self.optimizer.zero_grad()
+                self.optimizer_mlp.zero_grad()
+
                 step_time = time.time() - start_time
                 examples_per_second = self.config.batch_size / step_time
                 batch_metrics['examples_per_second'].append(examples_per_second)
-                
+                batch_metrics['grad_norm'].append(grad_norm)
+                batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
+                batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
+                batch_metrics['lr_mlp'].append(self.scheduler_mlp.get_last_lr()[0])
+
                 self.batch_counter += 1
                 self.example_counter += self.config.batch_size
 
@@ -492,7 +607,6 @@ class BasicTrainer(object):
                     mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
                     mean_train_metrics['counters/examples'] = self.example_counter
                     mean_train_metrics['counters/updates'] = self.batch_counter
-                    mean_train_metrics['counters/epoch'] = epoch
                     rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
                     if self.config.wandb.enabled and self.rank == 0:
@@ -501,116 +615,7 @@ class BasicTrainer(object):
                     last_log = time.time()
                 else:
                     rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-            #### END TRAINING ####
-            
-        # for batch in self.train_iterator:
-        #     #### BEGIN EVALUATION ####
-        #     if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-        #         rank0_print(f'Running evaluation after {self.example_counter} train examples')
-        #         self.policy.eval()
-        #         self.mlp.eval()
-
-        #         all_eval_metrics = defaultdict(list)
-        #         if self.config.sample_during_eval:
-        #             all_policy_samples, all_reference_samples = [], []
-        #             policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-        #             if self.config.loss.name == 'gupo':
-        #                 reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-
-        #         for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
-        #             local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-        #             with torch.no_grad():
-        #                 _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-        #             for k, v in eval_metrics.items():
-        #                 all_eval_metrics[k].extend(v)
-
-        #             if self.config.sample_during_eval:
-        #                 if 'FSDP' in self.config.trainer:
-        #                     with FSDP.summon_full_params(self.policy, writeback=False, recurse=False):
-        #                         policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-        #                 else:
-        #                     policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-
-        #                 all_policy_samples.extend(policy_samples)
-        #                 all_reference_samples.extend(reference_samples)
-
-        #                 for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-        #                     policy_text_table.add_data(self.example_counter, prompt, sample)
-        #                 if self.config.loss.name == 'gupo':
-        #                     for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-        #                         reference_text_table.add_data(self.example_counter, prompt, sample)
-
-        #         mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-        #         rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-        #         if self.config.sample_during_eval:                    
-        #             rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-        #             if self.config.loss.name == 'gupo':
-        #                 rank0_print(json.dumps(all_reference_samples[:10], indent=2))
-
-        #         if self.config.wandb.enabled and self.rank == 0:
-        #             wandb.log(mean_eval_metrics, step=self.example_counter)
-
-        #             if self.config.sample_during_eval:
-        #                 wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-        #                 if self.config.loss.name == 'gupo':
-        #                     wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
-
-        #         if self.example_counter > 0:
-        #             if self.config.debug:
-        #                 rank0_print('skipping save in debug mode')
-        #             else:
-        #                 output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-        #                 rank0_print(f'creating checkpoint to write to {output_dir}...')
-        #                 self.save(output_dir, mean_eval_metrics)
-        #     #### END EVALUATION ####
-
-        #     #### BEGIN TRAINING ####
-        #     self.policy.train()
-        #     self.mlp.train()
-
-        #     start_time = time.time()
-        #     batch_metrics = defaultdict(list)
-        #     for microbatch_idx in range(self.config.gradient_accumulation_steps):
-        #         global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
-        #         local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-        #         loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
-        #         (loss / self.config.gradient_accumulation_steps).backward()
-
-        #         for k, v in metrics.items():
-        #             batch_metrics[k].extend(v)
-
-        #     grad_norm = self.clip_gradient()
-        #     grad_norm_mlp = self.clip_gradient_mlp()
-        #     self.optimizer.step()
-        #     self.scheduler.step()
-        #     self.optimizer_mlp.step()
-        #     self.optimizer.zero_grad()
-        #     self.optimizer_mlp.zero_grad()
-
-        #     step_time = time.time() - start_time
-        #     examples_per_second = self.config.batch_size / step_time
-        #     batch_metrics['examples_per_second'].append(examples_per_second)
-        #     batch_metrics['grad_norm'].append(grad_norm)
-        #     batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-        #     batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
-
-        #     self.batch_counter += 1
-        #     self.example_counter += self.config.batch_size
-
-        #     if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-        #         mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-        #         mean_train_metrics['counters/examples'] = self.example_counter
-        #         mean_train_metrics['counters/updates'] = self.batch_counter
-        #         rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
-
-        #         if self.config.wandb.enabled and self.rank == 0:
-        #             wandb.log(mean_train_metrics, step=self.example_counter)
-
-        #         last_log = time.time()
-        #     else:
-        #         rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-        #     #### END TRAINING ####
+                #### END TRAINING ####
 
 
     def clip_gradient(self):
@@ -657,6 +662,10 @@ class BasicTrainer(object):
         scheduler_state_dict = self.scheduler.state_dict()
         self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
         del scheduler_state_dict
+
+        scheduler_mlp_state_dict = self.scheduler_mlp.state_dict()
+        self.write_state_dict(self.example_counter, scheduler_mlp_state_dict, metrics, 'scheduler_mlp.pt', output_dir)
+        del scheduler_mlp_state_dict
         
         try:
             from peft import PeftModel

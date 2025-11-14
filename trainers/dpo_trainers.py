@@ -85,115 +85,6 @@ def dpo_loss(policy_chosen_logps: torch.FloatTensor,
     return losses, chosen_rewards, rejected_rewards
 
 
-def forward_dpo_loss(policy_chosen_logps: torch.FloatTensor,
-             policy_rejected_logps: torch.FloatTensor,
-             reference_chosen_logps: torch.FloatTensor,
-             reference_rejected_logps: torch.FloatTensor,
-             beta: float,
-             reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the forward-KL-DPO loss for a batch of policy and reference model log probabilities.
-    
-    Args:
-        policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-        policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-        reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-        reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
-
-    Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
-        The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
-    """
-    pi_ref_chosen_logratios = policy_chosen_logps - reference_chosen_logps
-    pi_ref_rejected_logratios = policy_rejected_logps - reference_rejected_logps
-
-    # todo: we may need to stabilize this as it takes the exp operation.
-    # print(pi_ref_chosen_logratios, pi_ref_rejected_logratios)
-    # import ipdb; ipdb.set_trace()
-    pi_ref_chosen_probratios = -torch.exp(-pi_ref_chosen_logratios)
-    pi_ref_rejected_probratios = -torch.exp(-pi_ref_rejected_logratios)
-    logits = pi_ref_chosen_probratios - pi_ref_rejected_probratios
-
-    losses = -F.logsigmoid(beta * logits)
-    chosen_rewards = beta * (pi_ref_chosen_probratios).detach()
-    rejected_rewards = beta * (pi_ref_rejected_probratios).detach()
-    return losses, chosen_rewards, rejected_rewards
-
-
-def js_dpo_loss(policy_chosen_logps: torch.FloatTensor,
-             policy_rejected_logps: torch.FloatTensor,
-             reference_chosen_logps: torch.FloatTensor,
-             reference_rejected_logps: torch.FloatTensor,
-             beta: float,
-             reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the JS-DPO loss for a batch of policy and reference model log probabilities.
-    
-    Args:
-        policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-        policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-        reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-        reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
-
-    Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
-        The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
-    """
-    ref_pi_chosen_logratios =  reference_chosen_logps - policy_chosen_logps
-    ref_pi_rejected_logratios = reference_rejected_logps - policy_rejected_logps
-
-    # todo: we may need to stabilize this as it takes the exp operation.
-        
-    # ref_pi_chosen_probratios = torch.exp(ref_pi_chosen_logratios)
-    # ref_pi_rejected_probratios = torch.exp(ref_pi_rejected_logratios)
-    
-    logit_chosen = 0.6931471806 -  stabilized_log1pexp(ref_pi_chosen_logratios) #(1 + ref_pi_chosen_probratios)
-    logit_rejected = 0.6931471806 - stabilized_log1pexp(ref_pi_rejected_logratios)
-    logits = logit_chosen - logit_rejected
-
-    losses = -F.logsigmoid(beta * logits)
-    chosen_rewards = beta * (logit_chosen).detach()
-    rejected_rewards = beta * (logit_rejected).detach()
-    return losses, chosen_rewards, rejected_rewards
-
-
-def alpha_dpo_loss(policy_chosen_logps: torch.FloatTensor,
-             policy_rejected_logps: torch.FloatTensor,
-             reference_chosen_logps: torch.FloatTensor,
-             reference_rejected_logps: torch.FloatTensor,
-             beta: float,
-             alpha: float,
-             reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the forward-KL-DPO loss for a batch of policy and reference model log probabilities.
-    """
-    pi_ref_chosen_logratios = policy_chosen_logps - reference_chosen_logps
-    pi_ref_rejected_logratios = policy_rejected_logps - reference_rejected_logps
-
-    # todo: we may need to stabilize this as it takes the exp operation.
-    # print(pi_ref_chosen_logratios, pi_ref_rejected_logratios)
-    # import ipdb; ipdb.set_trace() 
-    # u = pi/pi_ref
-    # 1-(pi_ref/pi)^a 
-    
-    # pi_ref_chosen_probratios: log(pi/pi_ref)
-    # -alpha * pi_ref_chosen_logratios: alpha * log(pi_ref/pi)
-    # torch.exp(-alpha * pi_ref_chosen_logratios): (pi_ref/pi)^a
-    # pi_ref_chosen_probratios: -(pi_ref/pi)^a = -u^{-a}
-    # since 1/a will be cancelled out, so we can use -u^{-a} directly
-    pi_ref_chosen_probratios = -torch.exp(-alpha * pi_ref_chosen_logratios) / alpha
-    pi_ref_rejected_probratios = -torch.exp(-alpha * pi_ref_rejected_logratios) / alpha
-    logits = pi_ref_chosen_probratios - pi_ref_rejected_probratios
-
-    losses = -F.logsigmoid(beta * logits)
-    chosen_rewards = beta * (pi_ref_chosen_probratios).detach()
-    rejected_rewards = beta * (pi_ref_rejected_probratios).detach()
-    return losses, chosen_rewards, rejected_rewards
-
-
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
     """Compute the log probabilities of the given labels under the given logits.
 
@@ -285,18 +176,9 @@ class BasicTrainer(object):
         self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
+        
         if config.loss.name == 'dpo':
-            if config.loss.divergence == 'reverse_kl':
-                self._loss_fn = dpo_loss
-            elif config.loss.divergence == 'forward_kl':
-                self._loss_fn = forward_dpo_loss
-            elif config.loss.divergence == 'jsd':
-                self._loss_fn = js_dpo_loss
-            elif config.loss.divergence == 'alpha_divergence':
-                assert config.loss.alpha > 0 and config.loss.alpha < 1, f'alpha must be in (0, 1), got {config.loss.alpha}'
-                self._loss_fn = partial(alpha_dpo_loss, alpha=config.loss.alpha)
-            else:
-                raise ValueError(f'Unknown divergence {config.loss.divergence}')
+            self._loss_fn = dpo_loss
             
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
@@ -522,13 +404,25 @@ class BasicTrainer(object):
         policy_state_dict = self.policy.state_dict()
         self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
         del policy_state_dict
-        if False:
-            optimizer_state_dict = self.optimizer.state_dict()
-            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-            del optimizer_state_dict
+        
+        optimizer_state_dict = self.optimizer.state_dict()
+        self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
+        del optimizer_state_dict
 
-            scheduler_state_dict = self.scheduler.state_dict()
-            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        scheduler_state_dict = self.scheduler.state_dict()
+        self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
+        del scheduler_state_dict
+        
+        try:
+            from peft import PeftModel
+            if isinstance(self.policy, PeftModel):
+                adapter_dir = os.path.join(output_dir if output_dir is not None else os.path.join(self.run_dir, f'LATEST'), 'adapter')
+                os.makedirs(adapter_dir, exist_ok=True)
+                self.policy.save_pretrained(adapter_dir)
+                rank0_print(f'Saved PEFT adapter to {adapter_dir}')
+        except Exception as e:
+            rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
+
         print('Done.')
 
 

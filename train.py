@@ -79,8 +79,6 @@ def main(config: DictConfig):
     print(OmegaConf.to_yaml(config))
     # now = datetime.now()
     # time_string = now.strftime("%M %H %S")
-    if config.loss.name == 'dpo':
-        assert config.loss.divergence in config.exp_name, f'loss.divergence must be in the exp_name: {config.exp_name}'
     config_path = os.path.join(config.local_run_dir, 'config.yaml')
     with open(config_path, 'w') as f:
         OmegaConf.save(config, f)
