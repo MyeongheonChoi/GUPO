@@ -3,7 +3,7 @@ tokenizer_name_or_path: meta-llama/Llama-3.2-3B
 archive: null
 block_name: LlamaDecoderLayer
 
-policy_dtype: float16
+policy_dtype: float32
 fsdp_policy_mp: null
 reference_dtype: float16
 policy_quantization: 8bit

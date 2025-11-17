@@ -59,13 +59,20 @@ def gupo_loss(policy_chosen_logps: torch.FloatTensor,
         reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
         beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
         reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
+        beta_chosen: Per-example beta values for the chosen responses, predicted by a learned MLP. Shape: (batch_size,)
+        beta_rejected: Per-example beta values for the rejected responses, predicted by a learned MLP. Shape: (batch_size,)
+        rho: Correlation coefficient between the chosen and rejected responses. Default is 0 (independent).
 
     Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
+        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards, delta_V, mu, std, z).
         The losses tensor contains the GUPO loss for each example in the batch.
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
+        the delta_V, mu, std, z tensors contain intermediate values used in the loss computation.
     """
-    
+    # print(policy_chosen_logps)
+    # print(policy_rejected_logps)
+    # print(reference_chosen_logps)
+    # print(reference_rejected_logps)
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
     gamma = 0.5772156649
@@ -86,7 +93,7 @@ def gupo_loss(policy_chosen_logps: torch.FloatTensor,
 
     # print(losses.shape)
 
-    return losses, chosen_rewards, rejected_rewards
+    return losses, chosen_rewards, rejected_rewards, delta_V, mu, std, z
 
 
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
@@ -163,6 +170,20 @@ class BasicTrainer(object):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        self.autocast_dtype = torch.float32
+        self.autocast_enabled = False
+        
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                self.autocast_dtype = torch.bfloat16
+                self.autocast_enabled = True
+                rank0_print("✅ bfloat16 is supported. Using bfloat16 mixed precision (autocast).")
+            else:
+                # bfloat16은 안되지만 float16은 될 경우 (NaN 위험으로 사용 안 함)
+                rank0_print("⚠️ bfloat16 is NOT supported. Running in full float32 for stability.")
+        else:
+            rank0_print("CUDA is NOT available. Running on CPU (if configured).")
+
         self.data_iterator_kwargs = dict(
             names=config.datasets,
             tokenizer=self.tokenizer,
@@ -229,35 +250,37 @@ class BasicTrainer(object):
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
         concatenated_batch = concatenated_inputs(batch)
-        outputs = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], output_hidden_states=True)
-        
-        all_logits = outputs.logits.to(torch.float32)        
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
-        
-        if compute_beta:
-            all_hidden_states = outputs.hidden_states[-1] # (batch_size * 2, seq_len, hidden_size)
-            labels = concatenated_batch['concatenated_labels'][:, 1:].clone()
-            loss_mask = (labels != -100)
-            hidden_states_for_logps = all_hidden_states[:, :-1, :]
-            # hidden state mean pooling
-            masked_hidden_states = hidden_states_for_logps * loss_mask.unsqueeze(-1)
-            sum_hidden_states = masked_hidden_states.sum(dim=1)  # (batch_size * 2, hidden_size)
-            num_tokens = loss_mask.sum(dim=1).unsqueeze(-1).clamp(min=1)  # (batch_size * 2, 1)
-            mean_pooled_embeddings = sum_hidden_states / num_tokens  # (batch_size * 2, hidden_size)
-            
-            # print(mean_pooled_embeddings)
-            # all_betas_raw = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
-            all_betas = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
-            # all_betas = all_betas_raw * 9.9 + 0.1  # scale to (0.1, 10.0)
-            chosen_betas = all_betas[:batch['chosen_input_ids'].shape[0]]
-            rejected_betas = all_betas[batch['chosen_input_ids'].shape[0]:]
 
-            return chosen_logps, rejected_logps, chosen_betas, rejected_betas
-        
-        else:
-            return chosen_logps, rejected_logps, None, None
+        with torch.autocast(device_type='cuda', dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+            outputs = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], output_hidden_states=True)
+            
+            all_logits = outputs.logits.to(torch.float32)        
+            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+            chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
+            rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
+            
+            if compute_beta:
+                all_hidden_states = outputs.hidden_states[-1] # (batch_size * 2, seq_len, hidden_size)
+                labels = concatenated_batch['concatenated_labels'][:, 1:].clone()
+                loss_mask = (labels != -100)
+                hidden_states_for_logps = all_hidden_states[:, :-1, :]
+                # hidden state mean pooling
+                masked_hidden_states = hidden_states_for_logps * loss_mask.unsqueeze(-1)
+                sum_hidden_states = masked_hidden_states.sum(dim=1)  # (batch_size * 2, hidden_size)
+                num_tokens = loss_mask.sum(dim=1).unsqueeze(-1).clamp(min=1)  # (batch_size * 2, 1)
+                mean_pooled_embeddings = sum_hidden_states / num_tokens  # (batch_size * 2, hidden_size)
+                
+                # print(mean_pooled_embeddings)
+                # all_betas_raw = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
+                all_betas = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
+                # all_betas = all_betas_raw * 9.9 + 0.1  # scale to (0.1, 10.0)
+                chosen_betas = all_betas[:batch['chosen_input_ids'].shape[0]]
+                rejected_betas = all_betas[batch['chosen_input_ids'].shape[0]:]
+
+                return chosen_logps.to(torch.float32), rejected_logps.to(torch.float32), chosen_betas.to(torch.float32), rejected_betas.to(torch.float32)
+            
+            else:
+                return chosen_logps.to(torch.float32), rejected_logps.to(torch.float32), None, None
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -270,7 +293,7 @@ class BasicTrainer(object):
         with torch.no_grad():
             reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(self.reference_model, batch, compute_beta=False)
 
-        losses, chosen_rewards, rejected_rewards = gupo_loss(
+        losses, chosen_rewards, rejected_rewards, delta_V, mu, std, z = gupo_loss(
             policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=loss_config.beta_dpo, beta_chosen=beta_chosen, beta_rejected=beta_rejected, rho=loss_config.rho)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
@@ -287,6 +310,15 @@ class BasicTrainer(object):
         metrics[f'mlp_betas_{train_test}/chosen'] = beta_chosen.cpu().numpy().tolist()
         beta_rejected = all_gather_if_needed(beta_rejected.detach(), self.rank, self.world_size)
         metrics[f'mlp_betas_{train_test}/rejected'] = beta_rejected.cpu().numpy().tolist()
+
+        delta_V = all_gather_if_needed(delta_V.detach(), self.rank, self.world_size)
+        metrics[f'gupo_delta_V_{train_test}'] = delta_V.cpu().numpy().tolist()
+        mu = all_gather_if_needed(mu.detach(), self.rank, self.world_size)
+        metrics[f'gupo_mu_{train_test}'] = mu.cpu().numpy().tolist()
+        std = all_gather_if_needed(std.detach(), self.rank, self.world_size)
+        metrics[f'gupo_std_{train_test}'] = std.cpu().numpy().tolist()
+        z = all_gather_if_needed(z.detach(), self.rank, self.world_size)
+        metrics[f'gupo_z_{train_test}'] = z.cpu().numpy().tolist()
         
 
         policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
@@ -314,8 +346,8 @@ class BasicTrainer(object):
 
         rank0_print(f'Using {self.config.optimizer} optimizer for policy')
         rank0_print(f'Using {self.config.optimizer_mlp} optimizer for mlp')
-        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
-        self.optimizer_mlp = getattr(torch.optim, self.config.optimizer_mlp)(self.mlp.parameters(), lr=self.config.lr_mlp, weight_decay=0.01)
+        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.loss.lr)
+        self.optimizer_mlp = getattr(torch.optim, self.config.optimizer_mlp)(self.mlp.parameters(), lr=self.config.loss.lr_mlp, weight_decay=0.01)
         
         rank0_print("Calculating steps per epoch...")
         temp_epoch_iterator = get_batch_iterator(
@@ -352,9 +384,6 @@ class BasicTrainer(object):
             num_training_steps = total_steps_epoch2_onward
         )
         
-        # self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-        # self.scheduler_mlp = torch.optim.lr_scheduler.LambdaLR(self.optimizer_mlp, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-    
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -625,7 +654,7 @@ class BasicTrainer(object):
 
     def clip_gradient_mlp(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
-        return torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.config.max_grad_norm_mlp).item()
+        return torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.config.loss.max_grad_norm_mlp).item()
 
     def write_state_dict(self, step: int, state: Dict[str, torch.Tensor], metrics: Dict, filename: str, dir_name: Optional[str] = None):
         """Write a checkpoint to disk."""
