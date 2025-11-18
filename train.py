@@ -47,7 +47,15 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
     else:
         raise ValueError(f'Unknown loss name: {config.loss.name}')
     print(f'Creating trainer on process {rank} with world size {world_size}')
-    trainer = TrainerClass(policy, config, config.seed, config.local_run_dir, reference_model=reference_model, rank=rank, world_size=world_size)
+    trainer = TrainerClass(
+        policy, 
+        config, 
+        config.seed, 
+        config.local_run_dir, 
+        reference_model=reference_model, 
+        rank=rank, 
+        world_size=world_size
+    )
 
     trainer.train()
     trainer.save()
@@ -101,8 +109,8 @@ def main(config: DictConfig):
     
     if config.lora.enabled:
         print('applying LoRA adapters')
-        if getattr(policy, 'is_loaded_in_8bit', False) or getattr(policy, 'is_loaded_in_4bit', False):
-            policy = prepare_model_for_kbit_training(policy)
+        # if getattr(policy, 'is_loaded_in_8bit', False) or getattr(policy, 'is_loaded_in_4bit', False):
+        #     policy = prepare_model_for_kbit_training(policy)
             
         lora_config = LoraConfig(
             r=config.lora.r,

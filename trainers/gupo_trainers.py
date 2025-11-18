@@ -1,23 +1,11 @@
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
-import torch.nn.functional as F
 import torch.nn as nn
 import transformers
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import DictConfig
-from functools import partial
 
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    StateDictType,
-    BackwardPrefetch,
-    ShardingStrategy,
-    CPUOffload,
-)
-from torch.distributed.fsdp.api import FullStateDictConfig, FullOptimStateDictConfig
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from preference_datasets import get_batch_iterator
 from utils import (
@@ -186,7 +174,6 @@ class GUPOTrainer(object):
         self.data_iterator_kwargs = dict(
             names=config.datasets,
             tokenizer=self.tokenizer,
-            shuffle=True,
             max_length=config.max_length,
             max_prompt_length=config.max_prompt_length,
             sft_mode=False,
@@ -206,6 +193,7 @@ class GUPOTrainer(object):
             split='test', 
             n_examples=config.n_eval_examples, 
             batch_size=config.eval_batch_size, 
+            shuffle=False,
             silent=rank != 0, 
             cache_dir=get_local_dir(config.local_dirs)
         )
@@ -235,7 +223,7 @@ class GUPOTrainer(object):
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]], compute_beta: bool) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
         
-           We do this to avoid doing two forward passes, because it's faster for FSDP.
+           We do this to avoid doing two forward passes.
         """
         concatenated_batch = concatenated_inputs(batch)
 
@@ -365,7 +353,7 @@ class GUPOTrainer(object):
         else:
             self.optimizer.zero_grad()
             metrics['grad_norm'] = 0.0
-            metrics['lr'] = self.optimizer.param_grupos[0]['lr']
+            metrics['lr'] = self.optimizer.param_groups[0]['lr']
         
         if step_mlp:
             self.optimizer_mlp.step()
@@ -465,6 +453,7 @@ class GUPOTrainer(object):
                 n_epochs = 1,
                 n_examples = self.config.n_examples,
                 batch_size = self.config.batch_size,
+                shuffle = True,
                 silent = self.rank != 0,
                 cache_dir = get_local_dir(self.config.local_dirs)
             )
@@ -500,11 +489,7 @@ class GUPOTrainer(object):
                             all_eval_metrics[k].extend(v)
 
                         if self.config.sample_during_eval:
-                            if 'FSDP' in self.config.trainer:
-                                with FSDP.summon_full_params(self.policy, writeback=False, recurse=False):
-                                    policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-                            else:
-                                policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+                            policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
 
                             all_policy_samples.extend(policy_samples)
                             all_reference_samples.extend(reference_samples)
@@ -531,12 +516,9 @@ class GUPOTrainer(object):
                                 wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
                     if self.example_counter > 0:
-                        if self.config.debug:
-                            rank0_print('skipping save in debug mode')
-                        else:
-                            output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                            rank0_print(f'creating checkpoint to write to {output_dir}...')
-                            self.save(output_dir, mean_eval_metrics)
+                        output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
+                        rank0_print(f'creating checkpoint to write to {output_dir}...')
+                        self.save(output_dir, mean_eval_metrics)
                 #### END EVALUATION ####
 
                 #### BEGIN TRAINING ####
@@ -557,9 +539,10 @@ class GUPOTrainer(object):
                 grad_norm = self.clip_gradient()
                 grad_norm_mlp = self.clip_gradient_mlp()
 
-                stop_metrics = self.perform_optimization_step(epoch, grad_norm, grad_norm_mlp)
-                batch_metrics.update(stop_metrics)
-                
+                step_metrics = self.perform_optimization_step(epoch, grad_norm, grad_norm_mlp)
+                for k, v in step_metrics.items():
+                    batch_metrics[k].append(v)
+
                 step_time = time.time() - start_time
                 examples_per_second = self.config.batch_size / step_time
                 batch_metrics['examples_per_second'].append(examples_per_second)
@@ -582,6 +565,17 @@ class GUPOTrainer(object):
                     rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
             #### END TRAINING ####
 
+            rank0_print(f'End of Epoch {epoch}. Saving checkpoint...')
+            
+            # 에폭 기반의 폴더 이름 생성 (예: epoch-1_step-5000)
+            output_dir = os.path.join(self.run_dir, f'epoch-{epoch}_step-{self.example_counter}')
+            
+            # 평가를 스킵했을 경우 metrics는 None으로 전달합니다.
+            # (save 함수가 metrics=None을 처리하도록 되어 있으므로 안전합니다)
+            self.save(output_dir, metrics=None)
+            
+            rank0_print(f'Checkpoint saved to {output_dir}')
+
 
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
@@ -595,9 +589,7 @@ class GUPOTrainer(object):
         """
         Runs a fast evaluation pass focused *only* on the get_batch_metrics
         to check loss, rewards, and MLP beta values, skipping slow generation.
-        """
-        rank0_print(f'Running fast evaluation (MLP Beta check) after {self.example_counter} train examples')
-        
+        """        
         # 1. Set models to evaluation mode
         self.policy.eval()
         self.mlp.eval()
@@ -618,11 +610,7 @@ class GUPOTrainer(object):
 
         # 4. Calculate mean metrics
         mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-
-        # 5. Log to wandb (if enabled)
-        if self.config.wandb.enabled and self.rank == 0:
-            wandb.log(mean_eval_metrics, step=self.example_counter)
+        rank0_print(f'eval after: {formatted_dict(mean_eval_metrics)}')
             
         return mean_eval_metrics
 
@@ -642,11 +630,25 @@ class GUPOTrainer(object):
     
     def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
         """Save policy, optimizer, and scheduler state to disk."""
+        is_peft_model = False
+        try:
+            from peft import PeftModel
+            if isinstance(self.policy, PeftModel):
+                is_peft_model = True
+        except Exception as e:
+            rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
 
-        policy_state_dict = self.policy.state_dict()
-        self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
-        del policy_state_dict
-        
+        if is_peft_model:
+            adapter_dir = os.path.join(output_dir if output_dir is not None else os.path.join(self.run_dir, f'LATEST'), 'adapter')
+            os.makedirs(adapter_dir, exist_ok=True)
+            rank0_print(f'writing checkpoint to {adapter_dir}...')
+            self.policy.save_pretrained(adapter_dir)
+            rank0_print(f'Saved PEFT adapter to {adapter_dir}')
+        else:
+            policy_state_dict = self.policy.state_dict()
+            self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
+            del policy_state_dict
+
         mlp_state_dict = self.mlp.state_dict()
         self.write_state_dict(self.example_counter, mlp_state_dict, metrics, 'mlp.pt', output_dir)
         del mlp_state_dict
@@ -667,14 +669,6 @@ class GUPOTrainer(object):
         self.write_state_dict(self.example_counter, scheduler_mlp_state_dict, metrics, 'scheduler_mlp.pt', output_dir)
         del scheduler_mlp_state_dict
         
-        try:
-            from peft import PeftModel
-            if isinstance(self.policy, PeftModel):
-                adapter_dir = os.path.join(output_dir if output_dir is not None else os.path.join(self.run_dir, f'LATEST'), 'adapter')
-                os.makedirs(adapter_dir, exist_ok=True)
-                self.policy.save_pretrained(adapter_dir)
-                rank0_print(f'Saved PEFT adapter to {adapter_dir}')
-        except Exception as e:
-            rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
+        
 
         print('Done.')

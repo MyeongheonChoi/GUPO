@@ -13,7 +13,7 @@ rho: 0
 mlp_reg_lambda: 0.005
 
 # strategy : joint / alternating / phased
-strategy: initial
+learning_strategy: null
 lr: 5e-6
 lr_mlp: 5e-5
 max_grad_norm_mlp: 1.0
