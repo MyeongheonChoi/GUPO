@@ -14,8 +14,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from omegaconf import OmegaConf, DictConfig
 
-from trainers import dpo_trainers
-from trainers import gupo_trainers
+from trainers.dpo_trainers import BasicTrainer
+from trainers.gupo_trainers import GUPOTrainer
 
 import wandb
 import json
@@ -28,12 +28,6 @@ OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
-    if 'FSDP' in config.trainer:
-        init_distributed(rank, world_size, port=config.fsdp_port)
-    
-    if config.debug:
-        wandb.init = lambda *args, **kwargs: None
-        wandb.log = lambda *args, **kwargs: None
 
     if rank == 0 and config.wandb.enabled:
         os.environ['WANDB_CACHE_DIR'] = get_local_dir(config.local_dirs)
@@ -45,11 +39,11 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
             name=config.exp_name,
         )
     if config.loss.name == 'dpo':
-        TrainerClass = getattr(dpo_trainers, config.trainer)
+        TrainerClass = BasicTrainer
     elif config.loss.name == 'gupo':
-        TrainerClass = getattr(gupo_trainers, config.trainer)
+        TrainerClass = GUPOTrainer
     elif config.loss.name == 'sft':
-        TrainerClass = getattr(dpo_trainers, config.trainer)
+        TrainerClass = BasicTrainer
     else:
         raise ValueError(f'Unknown loss name: {config.loss.name}')
     print(f'Creating trainer on process {rank} with world size {world_size}')
@@ -89,7 +83,7 @@ def main(config: DictConfig):
  
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.local_dirs)
     print('building policy')
-    model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
+    model_kwargs = {'device_map': 'balanced'}
     if config.model.policy_quantization == '8bit':
         print('using 8-bit quantization for policy model')
         bnb_config = BitsAndBytesConfig(
@@ -149,13 +143,7 @@ def main(config: DictConfig):
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
     
-    if 'FSDP' in config.trainer:
-        world_size = torch.cuda.device_count()
-        print('starting', world_size, 'processes for FSDP training')
-        mp.spawn(worker_main, nprocs=world_size, args=(world_size, config, policy, reference_model), join=True)
-    else:
-        print('starting single-process worker')
-        worker_main(0, 1, config, policy, reference_model)
+    worker_main(0, 1, config, policy, reference_model)
 
 
 if __name__ == '__main__':

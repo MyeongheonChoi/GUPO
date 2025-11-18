@@ -12,8 +12,8 @@ rho: 0
 
 mlp_reg_lambda: 0.005
 
-initial_joint: true
-
+# strategy : joint / alternating / phased
+strategy: initial
 lr: 5e-6
 lr_mlp: 5e-5
 max_grad_norm_mlp: 1.0

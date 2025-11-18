@@ -151,7 +151,7 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
     return concatenated_batch
 
 
-class BasicTrainer(object):
+class GUPOTrainer(object):
     def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
         """A trainer for a language model, supporting GUPO training.
            
@@ -179,7 +179,6 @@ class BasicTrainer(object):
                 self.autocast_enabled = True
                 rank0_print("✅ bfloat16 is supported. Using bfloat16 mixed precision (autocast).")
             else:
-                # bfloat16은 안되지만 float16은 될 경우 (NaN 위험으로 사용 안 함)
                 rank0_print("⚠️ bfloat16 is NOT supported. Running in full float32 for stability.")
         else:
             rank0_print("CUDA is NOT available. Running on CPU (if configured).")
@@ -202,18 +201,6 @@ class BasicTrainer(object):
             nn.Softplus()
             ).to(self.policy.device)
 
-        if config.loss.initial_joint:
-            self.train_iterator = get_batch_iterator(
-                **self.data_iterator_kwargs, 
-                split='train', 
-                n_epochs=config.n_epochs, 
-                n_examples=config.n_examples, 
-                batch_size=config.batch_size, 
-                silent=rank != 0, 
-                cache_dir=get_local_dir(config.local_dirs)
-            )
-            rank0_print(f'Loaded train data iterator')
-
         self.eval_iterator = get_batch_iterator(
             **self.data_iterator_kwargs, 
             split='test', 
@@ -224,7 +211,7 @@ class BasicTrainer(object):
         )
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
-            
+
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing GUPO training) for the given batch of inputs."""
@@ -244,6 +231,7 @@ class BasicTrainer(object):
 
         return policy_output_decoded, reference_output_decoded
     
+
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]], compute_beta: bool) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
         
@@ -341,6 +329,60 @@ class BasicTrainer(object):
 
         return total_loss, metrics
 
+    def perform_optimization_step(self, epoch: int, grad_norm: float, grad_norm_mlp: float) -> Dict:
+        """
+        Helper function to decide which optimizers to step based on the learning straetegy and current epoch.
+        Returns a dictionary of metrics to be logged.
+        """
+        strategy = self.config.loss.learning_strategy
+        metrics = {}
+
+        step_policy = False
+        step_mlp = False
+
+        if strategy == 'joint':
+            step_policy = True
+            step_mlp = True
+        elif strategy == 'alternating':
+            if epoch % 2 == 1:
+                step_mlp = True
+            else:
+                step_policy = True
+        elif strategy == 'phased':
+            if epoch == 1:
+                step_mlp = True
+            else:
+                step_policy = True
+                step_mlp = True
+        else:
+            raise ValueError(f'Unknown learning strategy: {strategy}')
+        
+        if step_policy:
+            self.optimizer.step()
+            self.scheduler.step()
+            metrics['grad_norm'] = grad_norm
+            metrics['lr'] = self.scheduler.get_last_lr()[0]
+        else:
+            self.optimizer.zero_grad()
+            metrics['grad_norm'] = 0.0
+            metrics['lr'] = self.optimizer.param_grupos[0]['lr']
+        
+        if step_mlp:
+            self.optimizer_mlp.step()
+            self.scheduler_mlp.step()
+            metrics['grad_norm_mlp'] = grad_norm_mlp
+            metrics['lr_mlp'] = self.scheduler_mlp.get_last_lr()[0]
+        else:
+            self.optimizer_mlp.zero_grad()
+            metrics['grad_norm_mlp'] = 0.0
+            metrics['lr_mlp'] = self.optimizer_mlp.param_groups[0]['lr']
+
+        self.optimizer.zero_grad()
+        self.optimizer_mlp.zero_grad()
+
+        return metrics
+
+
     def train(self):
         """Begin GUPO training, with periodic evaluation."""
 
@@ -367,21 +409,41 @@ class BasicTrainer(object):
             raise ValueError("The training dataset is empty. Please check the dataset configuration.")
         
         total_training_steps = steps_per_epoch * self.config.n_epochs
-        total_steps_epoch2_onward = steps_per_epoch * (self.config.n_epochs - 1)
+
+        strategy = self.config.loss.learning_strategy
+        rank0_print(f"Using '{strategy}' learning strategy")
+
+        total_policy_steps = 0
+        total_mlp_steps = 0
+
+        if strategy == 'joint':
+            total_policy_steps = total_training_steps
+            total_mlp_steps = total_training_steps
+        elif strategy == 'alternating':
+            policy_epochs = self.config.n_epochs // 2
+            mlp_epochs = self.config.n_epochs - policy_epochs
+            total_policy_steps = steps_per_epoch * policy_epochs
+            total_mlp_steps = steps_per_epoch * mlp_epochs
+        elif strategy == 'phased':
+            total_mlp_steps = steps_per_epoch
+            total_policy_steps = steps_per_epoch * (self.config.n_epochs - 1)
         
-        if total_steps_epoch2_onward <= 0:
-            rank0_print("Warning: Total training steps for epoch 2 onward is less than or equal to zero. Adjusting warmup steps accordingly.")
-            total_steps_epoch2_onward = 1
-        
+        if total_policy_steps <= 0:
+            rank0_print("Warning: Total training steps for policy is less than or equal to zero. Adjusting warmup steps accordingly.")
+            total_policy_steps = 1
+        if total_mlp_steps <= 0:
+            rank0_print("Warning: Total training steps for mlp is less than or equal to zero. Adjusting warmup steps accordingly.")
+            total_mlp_steps = 1
+
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps = self.config.warmup_steps,
-            num_training_steps = total_training_steps
+            num_training_steps = total_policy_steps
         )
         self.scheduler_mlp = get_cosine_schedule_with_warmup(
             self.optimizer_mlp,
             num_warmup_steps = 0,
-            num_training_steps = total_steps_epoch2_onward
+            num_training_steps = total_mlp_steps
         )
         
         torch.manual_seed(self.seed)
@@ -394,151 +456,30 @@ class BasicTrainer(object):
         self.batch_counter = 0
         last_log = None
         
-        if not self.config.loss.initial_joint:
-            for epoch in range(1, self.config.n_epochs + 1):
-                rank0_print(f'===== Starting epoch {epoch}/{self.config.n_epochs} =====')
+        for epoch in range(1, self.config.n_epochs + 1):
+            rank0_print(f'===== Starting epoch {epoch}/{self.config.n_epochs} =====')
+            
+            epoch_train_iterator = get_batch_iterator(
+                **self.data_iterator_kwargs,
+                split = 'train',
+                n_epochs = 1,
+                n_examples = self.config.n_examples,
+                batch_size = self.config.batch_size,
+                silent = self.rank != 0,
+                cache_dir = get_local_dir(self.config.local_dirs)
+            )
+            
+            is_pahsed_warmup = (strategy == 'phased' and epoch == 1)
+            is_alternating_mlp = (strategy == 'alternating' and epoch % 2 == 1)
+
+            skip_eval_this_epoch = is_pahsed_warmup or is_alternating_mlp
+            if skip_eval_this_epoch:
+                rank0_print(f'Epoch {epoch} is an MLP-only training phase. Skipping evaluation.')
+
+            for batch in epoch_train_iterator:
                 
-                epoch_train_iterator = get_batch_iterator(
-                    **self.data_iterator_kwargs,
-                    split = 'train',
-                    n_epochs = 1,
-                    n_examples = self.config.n_examples,
-                    batch_size = self.config.batch_size,
-                    silent = self.rank != 0,
-                    cache_dir = get_local_dir(self.config.local_dirs)
-                )
-                
-                for batch in epoch_train_iterator:
-                    
-                    #### BEGIN EVALUATION ####
-                    if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-                        rank0_print(f'Running evaluation after {self.example_counter} train examples')
-                        self.policy.eval()
-                        self.mlp.eval()
-
-                        all_eval_metrics = defaultdict(list)
-                        if self.config.sample_during_eval:
-                            all_policy_samples, all_reference_samples = [], []
-                            policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                            if self.config.loss.name == 'gupo':
-                                reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-
-                        for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
-                            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                            with torch.no_grad():
-                                _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-                            for k, v in eval_metrics.items():
-                                all_eval_metrics[k].extend(v)
-
-                            if self.config.sample_during_eval:
-                                if 'FSDP' in self.config.trainer:
-                                    with FSDP.summon_full_params(self.policy, writeback=False, recurse=False):
-                                        policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-                                else:
-                                    policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-
-                                all_policy_samples.extend(policy_samples)
-                                all_reference_samples.extend(reference_samples)
-
-                                for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-                                    policy_text_table.add_data(self.example_counter, prompt, sample)
-                                if self.config.loss.name == 'gupo':
-                                    for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                        reference_text_table.add_data(self.example_counter, prompt, sample)
-
-                        mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-                        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-                        if self.config.sample_during_eval:                    
-                            rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                            if self.config.loss.name == 'gupo':
-                                rank0_print(json.dumps(all_reference_samples[:10], indent=2))
-
-                        if self.config.wandb.enabled and self.rank == 0:
-                            wandb.log(mean_eval_metrics, step=self.example_counter)
-
-                            if self.config.sample_during_eval:
-                                wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                                if self.config.loss.name == 'gupo':
-                                    wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
-
-                        if self.example_counter > 0:
-                            if self.config.debug:
-                                rank0_print('skipping save in debug mode')
-                            else:
-                                output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
-                                rank0_print(f'creating checkpoint to write to {output_dir}...')
-                                self.save(output_dir, mean_eval_metrics)
-                    #### END EVALUATION ####
-
-                    #### BEGIN TRAINING ####
-                    self.policy.train()
-                    self.mlp.train()
-
-                    start_time = time.time()
-                    batch_metrics = defaultdict(list)
-                    for microbatch_idx in range(self.config.gradient_accumulation_steps):
-                        global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
-                        local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-                        loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
-                        (loss / self.config.gradient_accumulation_steps).backward()
-
-                        for k, v in metrics.items():
-                            batch_metrics[k].extend(v)
-                    
-                    if epoch == 1:
-                        grad_norm_mlp = self.clip_gradient_mlp()
-                        
-                        self.optimizer_mlp.step()
-                        self.optimizer.zero_grad()
-                        self.optimizer_mlp.zero_grad()
-                        
-                        batch_metrics['grad_norm'].append(0.0)
-                        batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-                        batch_metrics['lr'].append(0.0)
-                    
-                    else:
-                        grad_norm = self.clip_gradient()
-                        grad_norm_mlp = self.clip_gradient_mlp()
-                        
-                        self.optimizer.step()
-                        self.scheduler.step()
-                        self.optimizer_mlp.step()
-                        self.scheduler_mlp.step()
-                        
-                        self.optimizer.zero_grad()
-                        self.optimizer_mlp.zero_grad()
-
-                        batch_metrics['grad_norm'].append(grad_norm)
-                        batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-                        batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
-                    
-                    batch_metrics['lr_mlp'].append(self.scheduler_mlp.get_last_lr()[0])
-                    step_time = time.time() - start_time
-                    examples_per_second = self.config.batch_size / step_time
-                    batch_metrics['examples_per_second'].append(examples_per_second)
-                    
-                    self.batch_counter += 1
-                    self.example_counter += self.config.batch_size
-
-                    if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-                        mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-                        mean_train_metrics['counters/examples'] = self.example_counter
-                        mean_train_metrics['counters/updates'] = self.batch_counter
-                        mean_train_metrics['counters/epoch'] = epoch
-                        rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
-
-                        if self.config.wandb.enabled and self.rank == 0:
-                            wandb.log(mean_train_metrics, step=self.example_counter)
-
-                        last_log = time.time()
-                    else:
-                        rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-                #### END TRAINING ####
-        else:
-            for batch in self.train_iterator:
                 #### BEGIN EVALUATION ####
-                if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval) and not skip_eval_this_epoch:
                     rank0_print(f'Running evaluation after {self.example_counter} train examples')
                     self.policy.eval()
                     self.mlp.eval()
@@ -615,21 +556,14 @@ class BasicTrainer(object):
 
                 grad_norm = self.clip_gradient()
                 grad_norm_mlp = self.clip_gradient_mlp()
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer_mlp.step()
-                self.scheduler_mlp.step()
-                self.optimizer.zero_grad()
-                self.optimizer_mlp.zero_grad()
 
+                stop_metrics = self.perform_optimization_step(epoch, grad_norm, grad_norm_mlp)
+                batch_metrics.update(stop_metrics)
+                
                 step_time = time.time() - start_time
                 examples_per_second = self.config.batch_size / step_time
                 batch_metrics['examples_per_second'].append(examples_per_second)
-                batch_metrics['grad_norm'].append(grad_norm)
-                batch_metrics['grad_norm_mlp'].append(grad_norm_mlp)
-                batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
-                batch_metrics['lr_mlp'].append(self.scheduler_mlp.get_last_lr()[0])
-
+                
                 self.batch_counter += 1
                 self.example_counter += self.config.batch_size
 
@@ -637,6 +571,7 @@ class BasicTrainer(object):
                     mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
                     mean_train_metrics['counters/examples'] = self.example_counter
                     mean_train_metrics['counters/updates'] = self.batch_counter
+                    mean_train_metrics['counters/epoch'] = epoch
                     rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
                     if self.config.wandb.enabled and self.rank == 0:
@@ -645,7 +580,7 @@ class BasicTrainer(object):
                     last_log = time.time()
                 else:
                     rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-                #### END TRAINING ####
+            #### END TRAINING ####
 
 
     def clip_gradient(self):
@@ -655,6 +590,41 @@ class BasicTrainer(object):
     def clip_gradient_mlp(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
         return torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.config.loss.max_grad_norm_mlp).item()
+
+    def evaluate_mlp(self):
+        """
+        Runs a fast evaluation pass focused *only* on the get_batch_metrics
+        to check loss, rewards, and MLP beta values, skipping slow generation.
+        """
+        rank0_print(f'Running fast evaluation (MLP Beta check) after {self.example_counter} train examples')
+        
+        # 1. Set models to evaluation mode
+        self.policy.eval()
+        self.mlp.eval()
+
+        all_eval_metrics = defaultdict(list)
+
+        # 2. Iterate over eval batches
+        for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            
+            with torch.no_grad():
+                # 3. Call get_batch_metrics (No generation)
+                # This function already calculates 'mlp_betas_eval/chosen' etc.
+                _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+
+            for k, v in eval_metrics.items():
+                all_eval_metrics[k].extend(v)
+
+        # 4. Calculate mean metrics
+        mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+        rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+
+        # 5. Log to wandb (if enabled)
+        if self.config.wandb.enabled and self.rank == 0:
+            wandb.log(mean_eval_metrics, step=self.example_counter)
+            
+        return mean_eval_metrics
 
     def write_state_dict(self, step: int, state: Dict[str, torch.Tensor], metrics: Dict, filename: str, dir_name: Optional[str] = None):
         """Write a checkpoint to disk."""
@@ -708,91 +678,3 @@ class BasicTrainer(object):
             rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
 
         print('Done.')
-
-
-class FSDPTrainer(BasicTrainer):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
-        """A trainer subclass that uses PyTorch FSDP to shard the model across multiple GPUs.
-        
-           This trainer will shard both the policy and reference model across all available GPUs.
-           Models are sharded at the block level, where the block class name is provided in the config.
-        """
-
-        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size)
-        assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
-
-        wrap_class = get_block_class_from_model(policy, config.model.block_name)
-        model_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={wrap_class},)
-
-        shared_fsdp_kwargs = dict(
-            auto_wrap_policy=model_auto_wrap_policy,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            cpu_offload=CPUOffload(offload_params=False),
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            device_id=rank,
-            ignored_modules=None,
-            limit_all_gathers=False,
-            use_orig_params=False,
-            sync_module_states=False
-        )
-
-        rank0_print('Sharding policy...')
-        mp_dtype = getattr(torch, config.model.fsdp_policy_mp) if config.model.fsdp_policy_mp is not None else None
-        policy_mp_policy = MixedPrecision(param_dtype=mp_dtype, reduce_dtype=mp_dtype, buffer_dtype=mp_dtype)
-        self.policy = FSDP(policy, **shared_fsdp_kwargs, mixed_precision=policy_mp_policy)
-
-        if config.activation_checkpointing:
-            rank0_print('Attempting to enable activation checkpointing...')
-            try:
-                # use activation checkpointing, according to:
-                # https://pytorch.org/blog/scaling-multimodal-foundation-models-in-torchmultimodal-with-pytorch-distributed/
-                #
-                # first, verify we have FSDP activation support ready by importing:
-                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-                    checkpoint_wrapper,
-                    apply_activation_checkpointing,
-                )
-            except Exception as e:
-                rank0_print('FSDP activation checkpointing not available:', e)
-            else:
-                check_fn = lambda submodule: isinstance(submodule, wrap_class)
-                rank0_print('Applying activation checkpointing wrapper to policy...')
-                apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn)
-                rank0_print('FSDP activation checkpointing enabled!')
-
-        if config.loss.name == 'gupo':
-            rank0_print('Sharding reference model...')
-            self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
-        
-        print('Loaded model on rank', rank)
-        dist.barrier()
-
-    def clip_gradient(self):
-        """Clip the gradient norm of the parameters of an FSDP policy, gathering the gradients across all GPUs."""
-        return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
-    
-    def save(self, output_dir=None, metrics=None):
-        """Save policy, optimizer, and scheduler state to disk, gathering from all processes and saving only on the rank 0 process."""
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
-            policy_state_dict = self.policy.state_dict()
-
-        if self.rank == 0:
-            self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
-        del policy_state_dict
-        dist.barrier()
-
-        save_policy = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, optim_state_dict_config=save_policy):
-            optimizer_state_dict = FSDP.optim_state_dict(self.policy, self.optimizer)
-
-        if self.rank == 0:
-            self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
-        del optimizer_state_dict
-        dist.barrier()
-
-        if self.rank == 0:
-            scheduler_state_dict = self.scheduler.state_dict()
-            self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
-        dist.barrier()
-        
