@@ -5,15 +5,12 @@ import transformers
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import DictConfig
 
-import torch.distributed as dist
-
 from preference_datasets import get_batch_iterator
 from utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
     all_gather_if_needed,
     pad_to_length,
-    get_block_class_from_model,
     rank0_print,
     get_local_dir,
 )
@@ -25,10 +22,11 @@ import random
 import os
 import math
 from collections import defaultdict
+import pandas as pd
 import time
 import json
-import functools
 from typing import Optional, Dict, List, Union, Tuple
+
 
 def gupo_loss(policy_chosen_logps: torch.FloatTensor,
              policy_rejected_logps: torch.FloatTensor,
@@ -57,10 +55,7 @@ def gupo_loss(policy_chosen_logps: torch.FloatTensor,
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
         the delta_V, mu, std, z tensors contain intermediate values used in the loss computation.
     """
-    # print(policy_chosen_logps)
-    # print(policy_rejected_logps)
-    # print(reference_chosen_logps)
-    # print(reference_rejected_logps)
+
     pi_logratios = policy_chosen_logps - policy_rejected_logps
     ref_logratios = reference_chosen_logps - reference_rejected_logps
     gamma = 0.5772156649
@@ -567,11 +562,7 @@ class GUPOTrainer(object):
 
             rank0_print(f'End of Epoch {epoch}. Saving checkpoint...')
             
-            # 에폭 기반의 폴더 이름 생성 (예: epoch-1_step-5000)
             output_dir = os.path.join(self.run_dir, f'epoch-{epoch}_step-{self.example_counter}')
-            
-            # 평가를 스킵했을 경우 metrics는 None으로 전달합니다.
-            # (save 함수가 metrics=None을 처리하도록 되어 있으므로 안전합니다)
             self.save(output_dir, metrics=None)
             
             rank0_print(f'Checkpoint saved to {output_dir}')
@@ -590,29 +581,97 @@ class GUPOTrainer(object):
         Runs a fast evaluation pass focused *only* on the get_batch_metrics
         to check loss, rewards, and MLP beta values, skipping slow generation.
         """        
-        # 1. Set models to evaluation mode
         self.policy.eval()
         self.mlp.eval()
 
         all_eval_metrics = defaultdict(list)
 
-        # 2. Iterate over eval batches
         for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
             local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
             
             with torch.no_grad():
-                # 3. Call get_batch_metrics (No generation)
-                # This function already calculates 'mlp_betas_eval/chosen' etc.
                 _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
 
             for k, v in eval_metrics.items():
                 all_eval_metrics[k].extend(v)
 
-        # 4. Calculate mean metrics
         mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
         rank0_print(f'eval after: {formatted_dict(mean_eval_metrics)}')
             
         return mean_eval_metrics
+    
+    def generate_beta_dataset(self):
+        """
+        Evaluates the MLP on the FULL evaluation dataset (not just the cached subset)
+        and returns a DataFrame.
+        """
+        rank0_print(f'Generating Beta Dataset for the FULL test set...')
+        
+        self.policy.eval()
+        self.mlp.eval()
+
+        full_eval_iterator = get_batch_iterator(
+            **self.data_iterator_kwargs,
+            split='test',
+            shuffle=False,
+            n_examples=None,          
+            n_epochs=1,
+            batch_size=self.config.eval_batch_size,
+            silent=(self.rank != 0),
+            cache_dir=get_local_dir(self.config.local_dirs)
+        )
+
+        results = []
+
+        iterator_wrapper = tqdm.tqdm(full_eval_iterator, desc="Generating Full Beta Data") if self.rank == 0 else full_eval_iterator
+
+        for eval_batch in iterator_wrapper:
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            
+            with torch.no_grad():
+                _, _, beta_chosen, beta_rejected = self.concatenated_forward(
+                    self.policy, local_eval_batch, compute_beta=True
+                )
+
+            if 'prompt' in eval_batch:
+                prompts = eval_batch['prompt']
+                choens = eval_batch.get('chosen', eval_batch.get('chosen_response', ["N/A"] * len(prompts)))
+                rejects = eval_batch.get('rejected', eval_batch.get('rejected_response', ["N/A"] * len(prompts)))
+                
+                if len(choens) > 0 and not isinstance(choens[0], str):
+                     choens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                if len(rejects) > 0 and not isinstance(rejects[0], str):
+                     rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
+            else:
+                prompts = self.tokenizer.batch_decode(eval_batch['prompt_input_ids'], skip_special_tokens=True)
+                choens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
+
+            batch_beta_c = beta_chosen.float().cpu().tolist()
+            batch_beta_r = beta_rejected.float().cpu().tolist()
+
+            for p, c, r, bc, br in zip(prompts, choens, rejects, batch_beta_c, batch_beta_r):
+                
+                if c.startswith(p):
+                    c = c[len(p):]
+                
+                if r.startswith(p):
+                    r = r[len(p):]
+                
+                c = c.strip()
+                r = r.strip()
+                
+                results.append({
+                    "prompt": p,
+                    "chosen_response": c,
+                    "rejected_response": r,
+                    "chosen_beta_mlp": bc,
+                    "rejected_beta_mlp": br,
+                })
+
+        df = pd.DataFrame(results)
+        rank0_print(f"Generated dataset with {len(df)} samples.")
+        return df
 
     def write_state_dict(self, step: int, state: Dict[str, torch.Tensor], metrics: Dict, filename: str, dir_name: Optional[str] = None):
         """Write a checkpoint to disk."""
@@ -668,7 +727,5 @@ class GUPOTrainer(object):
         scheduler_mlp_state_dict = self.scheduler_mlp.state_dict()
         self.write_state_dict(self.example_counter, scheduler_mlp_state_dict, metrics, 'scheduler_mlp.pt', output_dir)
         del scheduler_mlp_state_dict
-        
-        
 
         print('Done.')
