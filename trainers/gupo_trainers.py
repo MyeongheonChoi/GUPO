@@ -632,7 +632,27 @@ class GUPOTrainer(object):
                 chosen_logps, rejected_logps, beta_chosen, beta_rejected = self.concatenated_forward(
                     self.policy, local_eval_batch, compute_beta=True
                 )
-            implicit_rewards = chosen_logps - rejected_logps
+                reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
+                    self.reference_model, local_eval_batch, compute_beta=False
+                )
+                
+            pi_logratios = chosen_logps - rejected_logps
+            ref_logratios = reference_chosen_logps - reference_rejected_logps
+            gamma = 0.5772156649
+
+            logits = pi_logratios - ref_logratios
+            delta_V = self.config.loss.beta_dpo * logits
+            mu = gamma * (beta_rejected - beta_chosen)
+            std_squared = (math.pi**2 / 6) * (beta_chosen**2 + beta_rejected**2 - 2 * self.config.loss.rho * beta_chosen * beta_rejected)
+            std = torch.sqrt(std_squared)
+            z = (delta_V - mu) / std
+            
+            prob = torch.special.ndtr(z)
+            
+            chosen_rewards = self.config.loss.beta_dpo * (chosen_logps - reference_chosen_logps)
+            rejected_rewards = self.config.loss.beta_dpo * (rejected_logps - reference_rejected_logps)
+            
+            reward_margin = chosen_rewards - rejected_rewards
 
             if 'prompt' in eval_batch:
                 prompts = eval_batch['prompt']
@@ -650,9 +670,10 @@ class GUPOTrainer(object):
 
             batch_beta_c = beta_chosen.float().cpu().tolist()
             batch_beta_r = beta_rejected.float().cpu().tolist()
-            batch_implicit_rewards = implicit_rewards.float().cpu().tolist()
+            batch_prob = prob.float().cpu().tolist()
+            batch_reward_margin = reward_margin.float().cpu().tolist()
 
-            for p, c, r, bc, br, ir in zip(prompts, chosens, rejects, batch_beta_c, batch_beta_r, batch_implicit_rewards):
+            for p, c, r, bc, br, prob, rm in zip(prompts, chosens, rejects, batch_beta_c, batch_beta_r, batch_prob, batch_reward_margin):
                 
                 if c.startswith(p):
                     c = c[len(p):]
@@ -669,7 +690,8 @@ class GUPOTrainer(object):
                     "rejected_response": r,
                     "chosen_beta_mlp": bc,
                     "rejected_beta_mlp": br,
-                    "implicit_reward": ir,
+                    "probability": prob,
+                    "reward_margin": rm,
                 })
 
         df = pd.DataFrame(results)

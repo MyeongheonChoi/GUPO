@@ -16,6 +16,7 @@ from utils import (
     get_local_dir,
 )
 import numpy as np
+import pandas as pd
 import wandb
 import tqdm
 
@@ -429,6 +430,92 @@ class BasicTrainer(object):
     def clip_gradient(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
         return torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.config.max_grad_norm).item()
+    
+    def generate_beta_dataset(self):
+        """
+        Evaluates the MLP on the FULL evaluation dataset (not just the cached subset)
+        and returns a DataFrame.
+        """
+        rank0_print(f'Generating Beta Dataset for the FULL test set...')
+        
+        self.policy.eval()
+
+        full_eval_iterator = get_batch_iterator(
+            **self.data_iterator_kwargs,
+            split='test',
+            shuffle=False,
+            n_examples=None,          
+            n_epochs=1,
+            batch_size=self.config.eval_batch_size,
+            silent=(self.rank != 0),
+            cache_dir=get_local_dir(self.config.local_dirs)
+        )
+
+        results = []
+
+        iterator_wrapper = tqdm.tqdm(full_eval_iterator, desc="Generating Full Beta Data") if self.rank == 0 else full_eval_iterator
+
+        for eval_batch in iterator_wrapper:
+            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+            
+            with torch.no_grad():
+                chosen_logps, rejected_logps = self.concatenated_forward(
+                    self.policy, local_eval_batch
+                )
+                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(
+                    self.reference_model, local_eval_batch
+                )
+            pi_logratios = chosen_logps - rejected_logps
+            ref_logratios = reference_chosen_logps - reference_rejected_logps
+
+            logits = pi_logratios - ref_logratios
+            beta = self.config.loss.beta
+            prob = F.sigmoid(beta * logits)
+            
+            chosen_rewards = beta * (chosen_logps - reference_chosen_logps).detach()
+            rejected_rewards = beta * (rejected_logps - reference_rejected_logps).detach()
+            
+            reward_margin = chosen_rewards - rejected_rewards
+
+            if 'prompt' in eval_batch:
+                prompts = eval_batch['prompt']
+                chosens = eval_batch.get('chosen', eval_batch.get('chosen_response', ["N/A"] * len(prompts)))
+                rejects = eval_batch.get('rejected', eval_batch.get('rejected_response', ["N/A"] * len(prompts)))
+                
+                if len(chosens) > 0 and not isinstance(chosens[0], str):
+                     chosens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                if len(rejects) > 0 and not isinstance(rejects[0], str):
+                     rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
+            else:
+                prompts = self.tokenizer.batch_decode(eval_batch['prompt_input_ids'], skip_special_tokens=True)
+                chosens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
+
+            batch_prob = prob.float().cpu().tolist()
+            batch_reward_margin = reward_margin.float().cpu().tolist()
+
+            for p, c, r, prob, rm in zip(prompts, chosens, rejects, batch_prob, batch_reward_margin):
+                
+                if c.startswith(p):
+                    c = c[len(p):]
+                
+                if r.startswith(p):
+                    r = r[len(p):]
+                
+                c = c.strip()
+                r = r.strip()
+                
+                results.append({
+                    "prompt": p,
+                    "chosen_response": c,
+                    "rejected_response": r,
+                    "probability": prob,
+                    "reward_margin": rm,
+                })
+       
+        df = pd.DataFrame(results)
+        rank0_print(f"Generated dataset with {len(df)} samples.")
+        return df
 
     def write_state_dict(self, step: int, state: Dict[str, torch.Tensor], metrics: Dict, filename: str, dir_name: Optional[str] = None):
         """Write a checkpoint to disk."""

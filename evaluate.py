@@ -8,6 +8,7 @@ from transformers import BitsAndBytesConfig
 # --- 1. 학습 스크립트에서 필요한 모듈들 임포트 ---
 # (경로는 실제 프로젝트 구조에 맞게 수정해야 할 수 있습니다)
 from trainers.gupo_trainers import GUPOTrainer
+from trainers.dpo_trainers import BasicTrainer
 from utils import (                        
     rank0_print,
     get_local_dir,
@@ -106,23 +107,33 @@ def main(args):
     disable_dropout(reference_model)
 
     rank0_print("Initializing BasicTrainers...")
-    trainer = GUPOTrainer(
-        policy=policy,
-        config=config,
-        seed=config.seed,
-        run_dir=f"gupo_mlp_evaluation_{checkpoint_dir.split('/')[-1]}", 
-        reference_model=reference_model,
-    )
+    if config.loss.name == 'gupo':
+        trainer = GUPOTrainer(
+            policy=policy,
+            config=config,
+            seed=config.seed,
+            run_dir=f"gupo_mlp_evaluation_{checkpoint_dir.split('/')[-1]}", 
+            reference_model=reference_model,
+        )
 
-    mlp_checkpoint_path = os.path.join(checkpoint_dir, 'mlp.pt')
-    if os.path.exists(mlp_checkpoint_path):
-        mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location='cpu', weights_only=True)
-        trainer.mlp.load_state_dict(mlp_checkpoint['state'])
-        rank0_print(f"✅ Loaded MLP checkpoint from step {mlp_checkpoint.get('step_idx', 'N/A')}")
-    else:
-        raise FileNotFoundError(f"mlp.pt not found in {checkpoint_dir}. MLP 평가에 필수입니다.")
-    
-    trainer.mlp.to(trainer.policy.device)
+        mlp_checkpoint_path = os.path.join(checkpoint_dir, 'mlp.pt')
+        if os.path.exists(mlp_checkpoint_path):
+            mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location='cpu', weights_only=True)
+            trainer.mlp.load_state_dict(mlp_checkpoint['state'])
+            rank0_print(f"✅ Loaded MLP checkpoint from step {mlp_checkpoint.get('step_idx', 'N/A')}")
+        else:
+            raise FileNotFoundError(f"mlp.pt not found in {checkpoint_dir}. MLP 평가에 필수입니다.")
+        
+        trainer.mlp.to(trainer.policy.device)
+        
+    elif config.loss.name == 'dpo':
+        trainer = BasicTrainer(
+            policy=policy,
+            config=config,
+            seed=config.seed,
+            run_dir=f"dpo_evaluation_{checkpoint_dir.split('/')[-1]}", 
+            reference_model=reference_model,
+        )
 
     rank0_print("Generating Beta Data Table...")
     
@@ -135,9 +146,13 @@ def main(args):
     print(df_results.head())
 
     print("\n--- Beta Statistics ---")
-    print(df_results[['chosen_beta_mlp', 'rejected_beta_mlp', 'implicit_reward']].describe())
+    if config.loss.name == 'gupo':
+        print(df_results[['chosen_beta_mlp', 'rejected_beta_mlp', 'probability', 'reward_margin']].describe())
+        save_extreme_cases(df_results, checkpoint_dir, n)
+        
+    elif config.loss.name == 'dpo':
+        print(df_results[['probability', 'reward_margin']].describe())
 
-    save_extreme_cases(df_results, checkpoint_dir, n)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate MLP Beta from Checkpoint")
