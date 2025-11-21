@@ -4,6 +4,10 @@ seed: 0
 # name for this experiment in the local run directory and on wandb
 exp_name: null
 
+# learning rate
+lr: 5e-6
+lr_mlp: 5e-5
+
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
 batch_size: 4
 
@@ -41,6 +45,7 @@ gradient_accumulation_steps: 1
 
 # the maximum gradient norm to clip to
 max_grad_norm: 5.0
+max_grad_norm_mlp: 1.0
 
 # the maximum allowed length for an input (prompt + response)
 max_length: 512
@@ -68,7 +73,7 @@ warmup_steps: 150
 activation_checkpointing: false
 
 # evaluate and save model every eval_every steps
-eval_every: 10_000
+eval_every: 20_000
 
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 1.0

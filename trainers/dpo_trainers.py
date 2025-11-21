@@ -3,20 +3,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
 import torch.nn as nn
 import transformers
+from transformers import get_cosine_schedule_with_warmup
 from omegaconf import DictConfig
-from functools import partial
-
-import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    StateDictType,
-    BackwardPrefetch,
-    ShardingStrategy,
-    CPUOffload,
-)
-from torch.distributed.fsdp.api import FullStateDictConfig, FullOptimStateDictConfig
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 from preference_datasets import get_batch_iterator
 from utils import (
@@ -24,7 +12,6 @@ from utils import (
     formatted_dict,
     all_gather_if_needed,
     pad_to_length,
-    get_block_class_from_model,
     rank0_print,
     get_local_dir,
 )
@@ -158,11 +145,23 @@ class BasicTrainer(object):
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name_or_path, cache_dir=get_local_dir(config.local_dirs))
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            
+        self.autocast_dtype = torch.float32
+        self.autocast_enabled = False
+        
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                self.autocast_dtype = torch.bfloat16
+                self.autocast_enabled = True
+                rank0_print("✅ bfloat16 is supported. Using bfloat16 mixed precision (autocast).")
+            else:
+                rank0_print("⚠️ bfloat16 is NOT supported. Running in full float32 for stability.")
+        else:
+            rank0_print("CUDA is NOT available. Running on CPU (if configured).")
 
-        data_iterator_kwargs = dict(
+        self.data_iterator_kwargs = dict(
             names=config.datasets,
             tokenizer=self.tokenizer,
-            shuffle=True,
             max_length=config.max_length,
             max_prompt_length=config.max_prompt_length,
             sft_mode=config.loss.name == 'sft',
@@ -171,9 +170,15 @@ class BasicTrainer(object):
         self.policy = policy
         self.reference_model = reference_model
 
-        self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        rank0_print(f'Loaded train data iterator')
-        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+        self.eval_iterator = get_batch_iterator(
+            **self.data_iterator_kwargs, 
+            split='test', 
+            n_examples=config.n_eval_examples, 
+            batch_size=config.eval_batch_size,
+            shuffle=False,
+            silent=rank != 0, 
+            cache_dir=get_local_dir(config.local_dirs)
+        )
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
         
@@ -206,14 +211,16 @@ class BasicTrainer(object):
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
         
-           We do this to avoid doing two forward passes, because it's faster for FSDP.
+           We do this to avoid doing two forward passes..
         """
         concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
-        return chosen_logps, rejected_logps
+        
+        with torch.autocast(device_type='cuda', dtype=self.autocast_dtype, enabled=self.autocast_enabled):
+            all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
+            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+            chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
+            rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
+            return chosen_logps, rejected_logps
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
@@ -264,8 +271,32 @@ class BasicTrainer(object):
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lambda step: min(1.0, (step + 1) / (self.config.warmup_steps + 1)))
-    
+
+        rank0_print("Calculating steps per epoch...")
+        temp_epoch_iterator = get_batch_iterator(
+            **self.data_iterator_kwargs,
+            split = 'train',
+            n_epochs = 1,
+            n_examples = self.config.n_examples,
+            batch_size = self.config.batch_size,
+            silent = True,
+            cache_dir = get_local_dir(self.config.local_dirs)
+        )
+        
+        steps_per_epoch = len(list(temp_epoch_iterator))
+        del temp_epoch_iterator
+        
+        if steps_per_epoch == 0:
+            raise ValueError("The training dataset is empty. Please check the dataset configuration.")
+        
+        total_training_steps = steps_per_epoch * self.config.n_epochs
+        
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps = self.config.warmup_steps,
+            num_training_steps = total_training_steps
+        )
+        
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -277,107 +308,122 @@ class BasicTrainer(object):
         self.batch_counter = 0
         last_log = None
 
-        for batch in self.train_iterator:
-            #### BEGIN EVALUATION ####
-            if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
-                rank0_print(f'Running evaluation after {self.example_counter} train examples')
-                self.policy.eval()
+        for epoch in range(1, self.config.n_epochs + 1):
+            rank0_print(f'===== Starting epoch {epoch}/{self.config.n_epochs} =====')
+            
+            epoch_train_iterator = get_batch_iterator(
+                **self.data_iterator_kwargs,
+                split = 'train',
+                n_epochs = 1,
+                n_examples = self.config.n_examples,
+                batch_size = self.config.batch_size,
+                shuffle = True,
+                silent = self.rank != 0,
+                cache_dir = get_local_dir(self.config.local_dirs)
+            )
+            
+            for batch in epoch_train_iterator:
+                #### BEGIN EVALUATION ####
+                if self.example_counter % self.config.eval_every == 0 and (self.example_counter > 0 or self.config.do_first_eval):
+                    rank0_print(f'Running evaluation after {self.example_counter} train examples')
+                    self.policy.eval()
 
-                all_eval_metrics = defaultdict(list)
-                if self.config.sample_during_eval:
-                    all_policy_samples, all_reference_samples = [], []
-                    policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name == 'dpo':
-                        reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-
-                for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
-                    local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                    with torch.no_grad():
-                        _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-                    for k, v in eval_metrics.items():
-                        all_eval_metrics[k].extend(v)
-
+                    all_eval_metrics = defaultdict(list)
                     if self.config.sample_during_eval:
-                        if 'FSDP' in self.config.trainer:
-                            with FSDP.summon_full_params(self.policy, writeback=False, recurse=False):
-                                policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
-                        else:
+                        all_policy_samples, all_reference_samples = [], []
+                        policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+                        if self.config.loss.name == 'dpo':
+                            reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
+
+                    for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
+                        local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                        with torch.no_grad():
+                            _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
+
+                        for k, v in eval_metrics.items():
+                            all_eval_metrics[k].extend(v)
+
+                        if self.config.sample_during_eval:
                             policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
 
-                        all_policy_samples.extend(policy_samples)
-                        all_reference_samples.extend(reference_samples)
+                            all_policy_samples.extend(policy_samples)
+                            all_reference_samples.extend(reference_samples)
 
-                        for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-                            policy_text_table.add_data(self.example_counter, prompt, sample)
+                            for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                                policy_text_table.add_data(self.example_counter, prompt, sample)
+                            if self.config.loss.name == 'dpo':
+                                for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                                    reference_text_table.add_data(self.example_counter, prompt, sample)
+
+                    mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
+                    rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
+                    if self.config.sample_during_eval:                    
+                        rank0_print(json.dumps(all_policy_samples[:10], indent=2))
                         if self.config.loss.name == 'dpo':
-                            for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                reference_text_table.add_data(self.example_counter, prompt, sample)
+                            rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
-                mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
-                rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
-                if self.config.sample_during_eval:                    
-                    rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name == 'dpo':
-                        rank0_print(json.dumps(all_reference_samples[:10], indent=2))
+                    if self.config.wandb.enabled and self.rank == 0:
+                        wandb.log(mean_eval_metrics, step=self.example_counter)
 
-                if self.config.wandb.enabled and self.rank == 0:
-                    wandb.log(mean_eval_metrics, step=self.example_counter)
+                        if self.config.sample_during_eval:
+                            wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
+                            if self.config.loss.name == 'dpo':
+                                wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
-                    if self.config.sample_during_eval:
-                        wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name == 'dpo':
-                            wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
-
-                if self.example_counter > 0:
-                    if self.config.debug:
-                        rank0_print('skipping save in debug mode')
-                    else:
+                    if self.example_counter > 0:
                         output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
                         rank0_print(f'creating checkpoint to write to {output_dir}...')
                         self.save(output_dir, mean_eval_metrics)
-            #### END EVALUATION ####
+                #### END EVALUATION ####
 
-            #### BEGIN TRAINING ####
-            self.policy.train()
+                #### BEGIN TRAINING ####
+                self.policy.train()
 
-            start_time = time.time()
-            batch_metrics = defaultdict(list)
-            for microbatch_idx in range(self.config.gradient_accumulation_steps):
-                global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
-                local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-                loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
-                (loss / self.config.gradient_accumulation_steps).backward()
+                start_time = time.time()
+                batch_metrics = defaultdict(list)
+                for microbatch_idx in range(self.config.gradient_accumulation_steps):
+                    global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
+                    local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
+                    loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
+                    (loss / self.config.gradient_accumulation_steps).backward()
 
-                for k, v in metrics.items():
-                    batch_metrics[k].extend(v)
+                    for k, v in metrics.items():
+                        batch_metrics[k].extend(v)
 
-            grad_norm = self.clip_gradient()
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad()
+                grad_norm = self.clip_gradient()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
-            step_time = time.time() - start_time
-            examples_per_second = self.config.batch_size / step_time
-            batch_metrics['examples_per_second'].append(examples_per_second)
-            batch_metrics['grad_norm'].append(grad_norm)
+                step_time = time.time() - start_time
+                examples_per_second = self.config.batch_size / step_time
+                batch_metrics['examples_per_second'].append(examples_per_second)
+                batch_metrics['grad_norm'].append(grad_norm)
+                batch_metrics['lr'].append(self.scheduler.get_last_lr()[0])
 
-            self.batch_counter += 1
-            self.example_counter += self.config.batch_size
+                self.batch_counter += 1
+                self.example_counter += self.config.batch_size
 
-            if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
-                mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
-                mean_train_metrics['counters/examples'] = self.example_counter
-                mean_train_metrics['counters/updates'] = self.batch_counter
-                rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
+                if last_log is None or time.time() - last_log > self.config.minimum_log_interval_secs:
+                    mean_train_metrics = {k: sum(v) / len(v) for k, v in batch_metrics.items()}
+                    mean_train_metrics['counters/examples'] = self.example_counter
+                    mean_train_metrics['counters/updates'] = self.batch_counter
+                    rank0_print(f'train stats after {self.example_counter} examples: {formatted_dict(mean_train_metrics)}')
 
-                if self.config.wandb.enabled and self.rank == 0:
-                    wandb.log(mean_train_metrics, step=self.example_counter)
+                    if self.config.wandb.enabled and self.rank == 0:
+                        wandb.log(mean_train_metrics, step=self.example_counter)
 
-                last_log = time.time()
-            else:
-                rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
-            #### END TRAINING ####
+                    last_log = time.time()
+                else:
+                    rank0_print(f'skipping logging after {self.example_counter} examples to avoid logging too frequently')
+                    
+            rank0_print(f'End of Epoch {epoch}. Saving checkpoint...')
+            
+            output_dir = os.path.join(self.run_dir, f'epoch-{epoch}_step-{self.example_counter}')
+            self.save(output_dir, metrics=None)
+            
+            rank0_print(f'Checkpoint saved to {output_dir}')
+                #### END TRAINING ####
 
 
     def clip_gradient(self):
@@ -400,11 +446,25 @@ class BasicTrainer(object):
     
     def save(self, output_dir: Optional[str] = None, metrics: Optional[Dict] = None):
         """Save policy, optimizer, and scheduler state to disk."""
+        is_peft_model = False
+        try:
+            from peft import PeftModel
+            if isinstance(self.policy, PeftModel):
+                is_peft_model = True
+        except Exception as e:
+            rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
 
-        policy_state_dict = self.policy.state_dict()
-        self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
-        del policy_state_dict
-        
+        if is_peft_model:
+            adapter_dir = os.path.join(output_dir if output_dir is not None else os.path.join(self.run_dir, f'LATEST'), 'adapter')
+            os.makedirs(adapter_dir, exist_ok=True)
+            rank0_print(f'writing checkpoint to {adapter_dir}...')
+            self.policy.save_pretrained(adapter_dir)
+            rank0_print(f'Saved PEFT adapter to {adapter_dir}')
+        else:
+            policy_state_dict = self.policy.state_dict()
+            self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
+            del policy_state_dict
+
         optimizer_state_dict = self.optimizer.state_dict()
         self.write_state_dict(self.example_counter, optimizer_state_dict, metrics, 'optimizer.pt', output_dir)
         del optimizer_state_dict
@@ -412,15 +472,5 @@ class BasicTrainer(object):
         scheduler_state_dict = self.scheduler.state_dict()
         self.write_state_dict(self.example_counter, scheduler_state_dict, metrics, 'scheduler.pt', output_dir)
         del scheduler_state_dict
-        
-        try:
-            from peft import PeftModel
-            if isinstance(self.policy, PeftModel):
-                adapter_dir = os.path.join(output_dir if output_dir is not None else os.path.join(self.run_dir, f'LATEST'), 'adapter')
-                os.makedirs(adapter_dir, exist_ok=True)
-                self.policy.save_pretrained(adapter_dir)
-                rank0_print(f'Saved PEFT adapter to {adapter_dir}')
-        except Exception as e:
-            rank0_print('PEFT not installed or policy is not a PEFT model; skipping adapter save.', e)
 
         print('Done.')

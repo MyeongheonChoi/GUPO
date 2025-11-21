@@ -371,8 +371,8 @@ class GUPOTrainer(object):
 
         rank0_print(f'Using {self.config.optimizer} optimizer for policy')
         rank0_print(f'Using {self.config.optimizer_mlp} optimizer for mlp')
-        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.loss.lr)
-        self.optimizer_mlp = getattr(torch.optim, self.config.optimizer_mlp)(self.mlp.parameters(), lr=self.config.loss.lr_mlp, weight_decay=0.01)
+        self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
+        self.optimizer_mlp = getattr(torch.optim, self.config.optimizer_mlp)(self.mlp.parameters(), lr=self.config.lr_mlp, weight_decay=0.01)
         
         rank0_print("Calculating steps per epoch...")
         temp_epoch_iterator = get_batch_iterator(
@@ -574,7 +574,7 @@ class GUPOTrainer(object):
 
     def clip_gradient_mlp(self):
         """Clip the gradient norm of the parameters of a non-FSDP policy."""
-        return torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.config.loss.max_grad_norm_mlp).item()
+        return torch.nn.utils.clip_grad_norm_(self.mlp.parameters(), self.config.max_grad_norm_mlp).item()
 
     def evaluate_mlp(self):
         """
@@ -629,28 +629,30 @@ class GUPOTrainer(object):
             local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
             
             with torch.no_grad():
-                _, _, beta_chosen, beta_rejected = self.concatenated_forward(
+                chosen_logps, rejected_logps, beta_chosen, beta_rejected = self.concatenated_forward(
                     self.policy, local_eval_batch, compute_beta=True
                 )
+            implicit_rewards = chosen_logps - rejected_logps
 
             if 'prompt' in eval_batch:
                 prompts = eval_batch['prompt']
-                choens = eval_batch.get('chosen', eval_batch.get('chosen_response', ["N/A"] * len(prompts)))
+                chosens = eval_batch.get('chosen', eval_batch.get('chosen_response', ["N/A"] * len(prompts)))
                 rejects = eval_batch.get('rejected', eval_batch.get('rejected_response', ["N/A"] * len(prompts)))
                 
-                if len(choens) > 0 and not isinstance(choens[0], str):
-                     choens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                if len(chosens) > 0 and not isinstance(chosens[0], str):
+                     chosens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
                 if len(rejects) > 0 and not isinstance(rejects[0], str):
                      rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
             else:
                 prompts = self.tokenizer.batch_decode(eval_batch['prompt_input_ids'], skip_special_tokens=True)
-                choens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
+                chosens = self.tokenizer.batch_decode(eval_batch['chosen_input_ids'], skip_special_tokens=True)
                 rejects = self.tokenizer.batch_decode(eval_batch['rejected_input_ids'], skip_special_tokens=True)
 
             batch_beta_c = beta_chosen.float().cpu().tolist()
             batch_beta_r = beta_rejected.float().cpu().tolist()
+            batch_implicit_rewards = implicit_rewards.float().cpu().tolist()
 
-            for p, c, r, bc, br in zip(prompts, choens, rejects, batch_beta_c, batch_beta_r):
+            for p, c, r, bc, br, ir in zip(prompts, chosens, rejects, batch_beta_c, batch_beta_r, batch_implicit_rewards):
                 
                 if c.startswith(p):
                     c = c[len(p):]
@@ -667,6 +669,7 @@ class GUPOTrainer(object):
                     "rejected_response": r,
                     "chosen_beta_mlp": bc,
                     "rejected_beta_mlp": br,
+                    "implicit_reward": ir,
                 })
 
         df = pd.DataFrame(results)

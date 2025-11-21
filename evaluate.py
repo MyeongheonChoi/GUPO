@@ -135,7 +135,7 @@ def main(args):
     print(df_results.head())
 
     print("\n--- Beta Statistics ---")
-    print(df_results[['chosen_beta_mlp', 'rejected_beta_mlp']].describe())
+    print(df_results[['chosen_beta_mlp', 'rejected_beta_mlp', 'implicit_reward']].describe())
 
     save_extreme_cases(df_results, checkpoint_dir, n)
 
