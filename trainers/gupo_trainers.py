@@ -5,8 +5,8 @@ import transformers
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import DictConfig
 
-from preference_datasets import get_batch_iterator
-from utils import (
+from utils.preference_datasets import get_batch_iterator
+from utils.utils import (
     slice_and_move_batch_for_device,
     formatted_dict,
     all_gather_if_needed,

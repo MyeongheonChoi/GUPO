@@ -7,8 +7,8 @@ from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-from preference_datasets import extract_anthropic_prompt
-from convert_to_hf import prepare_weights_for_vllm
+from utils.preference_datasets import extract_anthropic_prompt
+from utils.convert_to_hf import prepare_weights_for_vllm
 
 
 def main(args):
