@@ -4,7 +4,7 @@ set -euo pipefail
 BASE_DIR="outputs"
 
 # 사용할 GPU 리스트 (예: 0번, 1번)
-GPUS=(0 1)
+GPUS=(0 1 2)
 
 # GPU별로 현재 돌고 있는 PID를 저장할 associative array
 declare -A GPU_PIDS

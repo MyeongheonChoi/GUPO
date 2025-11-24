@@ -1,11 +1,14 @@
 import argparse
 import os
 import json
-import torch
+import tqdm
 from omegaconf import OmegaConf
 from datasets import load_dataset
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
+
+from preference_datasets import extract_anthropic_prompt
+from convert_to_hf import prepare_weights_for_vllm
 
 
 def main(args):
@@ -18,23 +21,23 @@ def main(args):
     parent_dir = os.path.dirname(checkpoint_dir)
     config_dir = os.path.join(parent_dir, "config.yaml")
     config = OmegaConf.load(config_dir)
-    
 
-    base_model_path = config.model.name_or_path
-    print(f"🚀 Initializing vLLM Engine with base model: {base_model_path}")
-    
-    # LoRA 설정 확인
-    enable_lora = config.lora.enabled
-    
+    print("🔍 Checking and preparing model weights...")
+    # 이 함수 안에서도 config를 읽긴 하지만, 
+    # vLLM이 읽을 최종 경로(merged or adapter)를 얻기 위해 호출합니다.
+    model_path, use_lora, lora_path = prepare_weights_for_vllm(checkpoint_dir)
+    print(f"🚀 Initializing vLLM Engine")
+    print(f"   - Base Model: {model_path}")
+
     llm = LLM(
-        model=base_model_path,
-        enable_lora=enable_lora,
+        model=model_path,
+        enable_lora=use_lora,
         dtype="bfloat16",
         seed=config.seed,
         gpu_memory_utilization=0.9,
         max_model_len=args.max_len if args.max_len else config.model.get('max_length', 2048), # Config 없으면 args 사용
     )
-
+    stop_words = ["\nHuman:", "\n\nHuman:", "Human:", "\nUser:", "\n\nUser:"]
     # 샘플링 파라미터 (생성 시에만 쓰이는 설정이므로 args로 받음)
     sampling_params = SamplingParams(
         n=args.n_samples,
@@ -42,20 +45,15 @@ def main(args):
         top_p=args.top_p,
         skip_special_tokens=True,
         max_tokens=args.max_new_tokens,
+        stop=stop_words,
         stop_token_ids=[llm.get_tokenizer().eos_token_id]
     )
 
     # LoRA 요청 객체 생성
     lora_request = None
-    if enable_lora:
-        # 어댑터 경로는 체크포인트 폴더 안의 'adapter' 폴더로 자동 지정
-        adapter_path = os.path.join(checkpoint_dir, 'adapter')
-        
-        if not os.path.exists(adapter_path):
-             raise FileNotFoundError(f"❌ LoRA is enabled in config, but adapter not found at: {adapter_path}")
-
-        print(f"✅ LoRA Adapter will be applied from: {adapter_path}")
-        lora_request = LoRARequest("gupo_adapter", 1, adapter_path)
+    if use_lora and lora_path:
+        print(f"✅ LoRA Adapter will be applied from: {lora_path}")
+        lora_request = LoRARequest("gupo_adapter", 1, lora_path)
 
     # ------------------------------------------------------------------
     # 3. 테스트 데이터셋 로드 (생성 대상)
@@ -64,18 +62,23 @@ def main(args):
     print(f"📂 Loading dataset: {dataset_name} (split: {args.split})")
     
     if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
-        dataset = load_dataset("json", data_files=dataset_name, split=args.split)
+        dataset = load_dataset("json", data_files=dataset_name, split=args.split, data_dir='harmless-base')
     else:
-        dataset = load_dataset(dataset_name, split=args.split)
+        dataset = load_dataset(dataset_name, split=args.split, data_dir='harmless-base')
 
     # 프롬프트 컬럼 찾기
-    prompt_col = args.prompt_column
-    if prompt_col not in dataset.column_names:
-        if 'prompt' in dataset.column_names: prompt_col = 'prompt'
-        elif 'instruction' in dataset.column_names: prompt_col = 'instruction'
-        else: raise ValueError(f"Dataset columns {dataset.column_names} do not contain '{prompt_col}' key.")
+    prompts = []
+    for row in tqdm.tqdm(dataset, desc='Processing HH'):
+        prompt = extract_anthropic_prompt(row['chosen'])
+        prompts.append(prompt)
+    # prompt_col = args.prompt_column
+    # if prompt_col not in dataset.column_names:
+    #     if 'prompt' in dataset.column_names: prompt_col = 'prompt'
+    #     elif 'instruction' in dataset.column_names: prompt_col = 'instruction'
+    #     else: raise ValueError(f"Dataset columns {dataset.column_names} do not contain '{prompt_col}' key.")
             
-    prompts = dataset[prompt_col]
+    # prompts = dataset[prompt_col]
+
     print(f"📊 Total samples to generate: {len(prompts)}")
 
     # ------------------------------------------------------------------
@@ -131,7 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to the checkpoint directory (e.g., outputs/exp/step-1000)")
     
     # 선택: 데이터셋 (지정 안 하면 config의 학습 데이터셋을 쓸 수도 있음)
-    parser.add_argument("--dataset_name", type=str, default="anthropic/hh-rlhf", help="Dataset to generate responses for")
+    parser.add_argument("--dataset_name", type=str, default="Anthropic/hh-rlhf", help="Dataset to generate responses for")
     parser.add_argument("--split", type=str, default="test", help="Dataset split")
     parser.add_argument("--prompt_column", type=str, default="prompt", help="Column name for prompts")
     
