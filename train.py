@@ -7,7 +7,7 @@ import transformers
 from transformers import BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed
+from utils.utils import get_local_dir, get_local_run_dir, disable_dropout, init_distributed
 import os
 import hydra
 import torch.distributed as dist
