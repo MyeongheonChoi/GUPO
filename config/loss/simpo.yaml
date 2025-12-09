@@ -1,0 +1,9 @@
+# do DPO preference-based training
+name: simpo
+
+# the temperature parameter for DPO; lower values mean we care less about
+#   the reference model
+beta: 0.9
+
+gamma_beta_ratio: 0.0
+
