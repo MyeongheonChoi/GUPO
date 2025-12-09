@@ -210,19 +210,20 @@ class GUPOTrainer(object):
         self.policy = policy
         self.reference_model = reference_model
 
-        input_dim = self.policy.config.hidden_size * 2 # prompt + response
-        # self.mlp = nn.Sequential(
-        #     nn.LayerNorm(input_dim),
-        #     nn.Linear(input_dim, input_dim // 4),
-        #     nn.GELU(),
-        #     nn.Linear(input_dim // 4, 1),
-        #     nn.ELU()
-        #     ).to(self.policy.device)
-        
-        # nn.init.zeros_(self.mlp[-2].weight)
-        # nn.init.zeros_(self.mlp[-2].bias)
-
-        self.mlp = BetaMLP(self.policy).to(self.policy.device)
+        if not self.config.residual:
+            input_dim = self.policy.config.hidden_size * 2 # prompt + response
+            self.mlp = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, input_dim // 4),
+                nn.GELU(),
+                nn.Linear(input_dim // 4, 1),
+                nn.ELU()
+                ).to(self.policy.device)
+            
+            nn.init.zeros_(self.mlp[-2].weight)
+            nn.init.zeros_(self.mlp[-2].bias)
+        else:
+            self.mlp = BetaMLP(self.policy).to(self.policy.device)
 
         self.eval_iterator = get_batch_iterator(
             **self.data_iterator_kwargs, 
@@ -289,9 +290,12 @@ class GUPOTrainer(object):
                 response_embedding = response_sum / response_len  # (batch_size * 2, hidden_size)
 
                 final_input = torch.cat([prompt_embedding, response_embedding], dim=-1)  # (batch_size * 2, hidden_size * 2)
+                
+                if not self.config.residual:
+                    all_betas = self.mlp(final_input.detach()).squeeze(-1)  # (batch_size * 2,)
+                else:
+                    all_betas = self.mlp(final_input.detach(), response_embedding.detach()).squeeze(-1)  # (batch_size * 2,)
 
-                # all_betas = self.mlp(final_input.detach()).squeeze(-1)  # (batch_size * 2,)
-                all_betas = self.mlp(final_input.detach(), response_embedding.detach()).squeeze(-1)  # (batch_size * 2,)
                 all_betas += 1.
                 # # hidden state mean pooling
                 # masked_hidden_states = hidden_states_for_logps * loss_mask.unsqueeze(-1)
