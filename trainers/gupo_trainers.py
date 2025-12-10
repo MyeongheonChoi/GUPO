@@ -210,7 +210,8 @@ class GUPOTrainer(object):
         self.policy = policy
         self.reference_model = reference_model
 
-        if not self.config.residual:
+        if not self.config.loss.residual:
+            print('✅ Using standard MLP for beta prediction')
             input_dim = self.policy.config.hidden_size * 2 # prompt + response
             self.mlp = nn.Sequential(
                 nn.LayerNorm(input_dim),
@@ -223,6 +224,7 @@ class GUPOTrainer(object):
             nn.init.zeros_(self.mlp[-2].weight)
             nn.init.zeros_(self.mlp[-2].bias)
         else:
+            print('✅ Using residual MLP for beta prediction')
             self.mlp = BetaMLP(self.policy).to(self.policy.device)
 
         self.eval_iterator = get_batch_iterator(
@@ -291,7 +293,7 @@ class GUPOTrainer(object):
 
                 final_input = torch.cat([prompt_embedding, response_embedding], dim=-1)  # (batch_size * 2, hidden_size * 2)
                 
-                if not self.config.residual:
+                if not self.config.loss.residual:
                     all_betas = self.mlp(final_input.detach()).squeeze(-1)  # (batch_size * 2,)
                 else:
                     all_betas = self.mlp(final_input.detach(), response_embedding.detach()).squeeze(-1)  # (batch_size * 2,)
