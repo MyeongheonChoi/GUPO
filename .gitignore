@@ -12,3 +12,8 @@ wheels/
 outputs/
 *.ipynb
 armorm/
+
+.env
+.env.*
+
+*.jsonl
