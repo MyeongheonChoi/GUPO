@@ -17,3 +17,5 @@ armorm/
 .env.*
 
 *.jsonl
+
+gpteval/

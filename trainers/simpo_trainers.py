@@ -28,14 +28,6 @@ import json
 import functools
 from typing import Optional, Dict, List, Union, Tuple
 
-def stabilized_log1pexp(x):
-    """
-    Compute log(1 + exp(x)) in a numerically stable way."""
-    mask = x > 0
-    risky_x = torch.where(mask, x, torch.zeros_like(x))
-    safe_x = torch.where(mask, torch.zeros_like(x), x)
-    return torch.where(mask, risky_x + torch.log1p(torch.exp(-risky_x)), torch.log1p(torch.exp(safe_x)))
-
 
 def simpo_loss(policy_chosen_logps: torch.FloatTensor,
              policy_rejected_logps: torch.FloatTensor,

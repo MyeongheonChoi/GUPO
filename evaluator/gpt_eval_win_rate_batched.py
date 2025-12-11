@@ -124,9 +124,113 @@ def wait_for_batch(batch_id: str, poll_interval: int = 10):
         time.sleep(poll_interval)
 
 
-# --------------------
-# 4) Batch output 파싱 + winrate 계산
-# --------------------
+def _clean_json_like_string(s: str) -> str:
+    """모델이 코드블럭이나 설명 텍스트를 섞어서 줄 때,
+    실제 JSON 부분만 최대한 깔끔하게 뽑아내기 위한 유틸.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.strip()
+    if not s:
+        return s
+
+    # ```json ... ``` 또는 ``` ... ``` 코드블럭 벗기기
+    if s.startswith("```"):
+        lines = s.splitlines()
+        # 첫 줄이 ```로 시작하면 제거
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        # 마지막 줄이 ```면 제거
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+
+    # 아직도 첫 글자가 {가 아니면, 안쪽에서 { ... } 범위만 잘라내기
+    if not s.startswith("{"):
+        first = s.find("{")
+        last = s.rfind("}")
+        if first != -1 and last != -1 and first < last:
+            s = s[first : last + 1].strip()
+
+    return s
+
+
+
+# def parse_batch_output(
+#     batch,
+#     prompts,
+#     responses_a,
+#     responses_b,
+#     a_name: str,
+#     b_name: str,
+#     save_file_path: str,
+# ):
+#     """
+#     batch.output_file_id를 받아서 JSONL 결과를 파싱하고,
+#     comparison / win / winrate를 계산해 저장.
+#     """
+#     output_file_id = batch.output_file_id or batch.error_file_id
+#     if not output_file_id:
+#         raise RuntimeError("No output_file_id or error_file_id on batch result.")
+
+#     file_response = client.files.content(output_file_id)
+#     # 라이브러리 버전에 따라 .content 또는 .text 중 하나를 써야 할 수 있음
+#     content_bytes = file_response.content
+#     lines = content_bytes.decode("utf-8").strip().split("\n")
+
+#     A_cnt = 0
+#     B_cnt = 0
+#     win_list = []
+
+#     with open(save_file_path, "w", encoding="utf-8") as out_f:
+#         for line in lines:
+#             if not line.strip():
+#                 continue
+#             obj = json.loads(line)
+
+#             # output JSONL 구조:
+#             # { "id": ..., "custom_id": "...",
+#             #   "response": { "status_code": 200, "body": { ...chat completion... } },
+#             #   "error": null }
+#             custom_id = obj["custom_id"]
+#             response_obj = obj.get("response")
+#             error_obj = obj.get("error")
+
+#             if error_obj is not None:
+#                 print(f"[WARNING] error in request {custom_id}: {error_obj}")
+#                 continue
+
+#             body = response_obj["body"]
+#             raw_content = body["choices"][0]["message"]["content"]
+#             completion = json.loads(raw_content)
+
+#             comparison = completion["comparison"]
+#             win = completion["win"]
+
+#             # custom_id에서 인덱스 복원
+#             idx = int(custom_id.split("-")[-1])
+
+#             win_list.append(win)
+#             if win == "A":
+#                 A_cnt += 1
+#             elif win == "B":
+#                 B_cnt += 1
+#             else:
+#                 print(f"[WARNING] unexpected win value: {win}")
+
+#             record = {
+#                 "prompt": prompts[idx],
+#                 "response_A": responses_a[idx],
+#                 "response_B": responses_b[idx],
+#                 "comparison": comparison,
+#                 "win": win,
+#             }
+#             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+#     total = len(win_list) if win_list else 1
+#     print("Saved to", save_file_path)
+#     print(f"\n {a_name} Win Rate: {A_cnt / total * 100:.2f}%")
+#     print(f"\n {b_name} Win Rate: {B_cnt / total * 100:.2f}%")
 def parse_batch_output(
     batch,
     prompts,
@@ -157,13 +261,14 @@ def parse_batch_output(
         for line in lines:
             if not line.strip():
                 continue
+
             obj = json.loads(line)
 
             # output JSONL 구조:
             # { "id": ..., "custom_id": "...",
             #   "response": { "status_code": 200, "body": { ...chat completion... } },
             #   "error": null }
-            custom_id = obj["custom_id"]
+            custom_id = obj.get("custom_id")
             response_obj = obj.get("response")
             error_obj = obj.get("error")
 
@@ -171,23 +276,70 @@ def parse_batch_output(
                 print(f"[WARNING] error in request {custom_id}: {error_obj}")
                 continue
 
-            body = response_obj["body"]
-            raw_content = body["choices"][0]["message"]["content"]
-            completion = json.loads(raw_content)
+            if response_obj is None:
+                print(f"[WARNING] no response object for {custom_id}")
+                continue
+
+            status_code = response_obj.get("status_code")
+            if status_code != 200:
+                print(f"[WARNING] non-200 status for {custom_id}: {status_code}")
+                continue
+
+            body = response_obj.get("body", {})
+            choices = body.get("choices", [])
+            if not choices:
+                print(f"[WARNING] no choices in body for {custom_id}")
+                continue
+
+            message = choices[0].get("message", {})
+
+            # 1) response_format=json_object 를 썼을 때,
+            #    SDK에 따라 message["parsed"]가 붙어 있을 수 있으니 먼저 사용 시도
+            if isinstance(message, dict) and "parsed" in message and message["parsed"] is not None:
+                completion = message["parsed"]
+            else:
+                # 2) content에서 JSON 문자열 추출
+                raw_content = message.get("content", "")
+                cleaned = _clean_json_like_string(raw_content)
+
+                if not cleaned:
+                    print(f"[WARNING] empty content for {custom_id}")
+                    continue
+
+                try:
+                    completion = json.loads(cleaned)
+                except json.JSONDecodeError as e:
+                    print(f"[WARNING] JSON decode failed for {custom_id}: {e}")
+                    print("  Raw content (first 300 chars):", repr(cleaned[:300]))
+                    continue
+
+            # 여기까지 오면 completion은 dict 여야 함
+            if not isinstance(completion, dict):
+                print(f"[WARNING] completion is not dict for {custom_id}: {type(completion)}")
+                continue
+
+            if "comparison" not in completion or "win" not in completion:
+                print(f"[WARNING] missing keys in completion for {custom_id}: {completion.keys()}")
+                continue
 
             comparison = completion["comparison"]
             win = completion["win"]
 
             # custom_id에서 인덱스 복원
-            idx = int(custom_id.split("-")[-1])
+            try:
+                idx = int(str(custom_id).split("-")[-1])
+            except Exception:
+                print(f"[WARNING] cannot parse idx from custom_id={custom_id}")
+                continue
 
+            # win 카운트
             win_list.append(win)
             if win == "A":
                 A_cnt += 1
             elif win == "B":
                 B_cnt += 1
             else:
-                print(f"[WARNING] unexpected win value: {win}")
+                print(f"[WARNING] unexpected win value for {custom_id}: {win}")
 
             record = {
                 "prompt": prompts[idx],
@@ -241,8 +393,8 @@ if __name__ == "__main__":
 
     timestamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d_%H%M%S")
 
-    batch_input_path = f"./gpt_eval_batch_input_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
-    save_file_path = f"./gpt_eval_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
+    batch_input_path = f"./gpteval/gpt_eval_batch_input_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
+    save_file_path = f"./gpteval/gpt_eval_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
 
     print("Batch input path:", batch_input_path)
     print("Final save path:", save_file_path)

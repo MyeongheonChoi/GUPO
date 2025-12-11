@@ -4,6 +4,7 @@ import json
 import openai 
 import datasets
 import argparse
+from tqdm import tqdm
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -52,14 +53,14 @@ def get_gpt_label(input_prompt:str):
             }       
         ],
     )
-    print(response)
+    # print(response)
     
     raw = response.choices[0].message.content
     completion = json.loads(raw)
     # print(completion)
     comparison = completion['comparison']
     win = completion['win']
-    print(f"Comparison: {comparison}, Win: {win}")
+    # print(f"Comparison: {comparison}, Win: {win}")
     return comparison, win
 
 if __name__ == "__main__":
@@ -68,9 +69,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument('--num_eval', type=int, help='Number of samples to evaluate')
-    parser.add_argument('--A', type=str, help='response A text directory')
+    parser.add_argument('--A', type=str, help='response A text file directory .jsonl')
     parser.add_argument('--A_name', type=str, help='response A algorithm')
-    parser.add_argument('--B', type=str, help='response B text directory')
+    parser.add_argument('--B', type=str, help='response B text file directory .jsonl')
     parser.add_argument('--B_name', type=str, help='response B algorithm')
     parser.set_defaults(eval_now=True)
     
@@ -98,7 +99,7 @@ if __name__ == "__main__":
     response_B = dataset_B['generated_response']
 
     timestamp = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d_%H%M%S")
-    save_file_path = f"./gpt_eval_winrate_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
+    save_file_path = f"./gpteval/gpt_eval_winrate_{args.A_name}vs{args.B_name}_{timestamp}.jsonl"
 
     print("Save path:", save_file_path)
     comparison_list = []
@@ -106,7 +107,7 @@ if __name__ == "__main__":
     A_cnt = 0
     B_cnt = 0
     file=open(save_file_path, 'w')
-    for p, A, B in zip(prompt, response_A, response_B):
+    for p, A, B in tqdm(zip(prompt, response_A, response_B)):
         comparison, win = get_gpt_label(create_prompt(p, A, B))
         comparison_list.append(comparison)
         win_list.append(win)
