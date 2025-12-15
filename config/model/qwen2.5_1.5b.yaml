@@ -1,0 +1,9 @@
+name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+tokenizer_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+archive: null
+block_name: Qwen2DecoderLayer
+
+policy_dtype: float16
+fsdp_policy_mp: null
+reference_dtype: float16
+policy_quantization: null
