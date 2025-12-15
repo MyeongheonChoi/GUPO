@@ -5,7 +5,7 @@ from datasets import load_dataset
 from openai import OpenAI
 from tqdm import tqdm
 
-client = OpenAI(api_key="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")
+client = OpenAI(api_key="")
 model_name = "gpt-5-mini"
 
 dataset = load_dataset("Anthropic/hh-rlhf", split="test")
