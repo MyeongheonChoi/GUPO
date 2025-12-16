@@ -1,8 +1,0 @@
-# do AlphaDPO preference-based training
-name: alphadpo
-
-# the temperature parameter for DPO; lower values mean we care less about
-#   the reference model
-beta: 10.0
-alpha: 0.2
-gamma_beta_ratio: 0.4
