@@ -134,6 +134,36 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
     return concatenated_batch
 
 
+class BetaMLP(nn.Module):
+    def __init__(self, policy):
+        super().__init__()
+
+        input_dim = policy.config.hidden_size * 2 # prompt + response
+        hidden_dim = input_dim // 4
+
+        self.main_norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+
+        self.res_norm = nn.LayerNorm(policy.config.hidden_size)
+        self.res_proj = nn.Linear(policy.config.hidden_size, hidden_dim)
+
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.final_act = nn.Softplus()
+    
+    def forward(self, concat_x, response_x):
+        h1 = self.fc1(self.main_norm(concat_x))
+        h_res = self.res_proj(self.res_norm(response_x))
+        h = self.act(h1 + h_res)
+        out = self.final_act(self.fc2(h))
+
+        return out
+        
+
+
+
+
+
 class GUPOTrainer(object):
     def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
         """A trainer for a language model, supporting GUPO training.
@@ -176,12 +206,19 @@ class GUPOTrainer(object):
 
         self.policy = policy
         self.reference_model = reference_model
-        self.mlp = nn.Sequential(
-            nn.Linear(self.policy.config.hidden_size, self.policy.config.hidden_size // 4),
-            nn.GELU(),
-            nn.Linear(self.policy.config.hidden_size // 4, 1),
-            nn.Softplus()
-            ).to(self.policy.device)
+
+        if not self.config.loss.residual:
+            print('✅ Using standard MLP for beta prediction')
+            input_dim = self.policy.config.hidden_size
+            self.mlp = nn.Sequential(
+                nn.Linear(input_dim, input_dim // 4),
+                nn.GELU(),
+                nn.Linear(input_dim // 4, 1),
+                nn.Softplus()
+                ).to(self.policy.device)
+        else:
+            print('✅ Using residual MLP for beta prediction')
+            self.mlp = BetaMLP(self.policy).to(self.policy.device)
 
         self.eval_iterator = get_batch_iterator(
             **self.data_iterator_kwargs, 
@@ -233,18 +270,27 @@ class GUPOTrainer(object):
             if compute_beta:
                 all_hidden_states = outputs.hidden_states[-1] # (batch_size * 2, seq_len, hidden_size)
                 labels = concatenated_batch['concatenated_labels'][:, 1:].clone()
-                loss_mask = (labels != -100)
+                attention_mask = concatenated_batch['concatenated_attention_mask'][:, 1:].clone()
                 hidden_states_for_logps = all_hidden_states[:, :-1, :]
-                # hidden state mean pooling
-                masked_hidden_states = hidden_states_for_logps * loss_mask.unsqueeze(-1)
-                sum_hidden_states = masked_hidden_states.sum(dim=1)  # (batch_size * 2, hidden_size)
-                num_tokens = loss_mask.sum(dim=1).unsqueeze(-1).clamp(min=1)  # (batch_size * 2, 1)
-                mean_pooled_embeddings = sum_hidden_states / num_tokens  # (batch_size * 2, hidden_size)
                 
-                # print(mean_pooled_embeddings)
-                # all_betas_raw = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
-                all_betas = self.mlp(mean_pooled_embeddings.detach()).squeeze(-1)  # (batch_size * 2,)
-                # all_betas = all_betas_raw * 9.9 + 0.1  # scale to (0.1, 10.0)
+                response_mask = (labels != -100)
+                prompt_mask = (attention_mask == 1) & (response_mask == 0)
+
+                prompt_sum = (hidden_states_for_logps * prompt_mask.unsqueeze(-1)).sum(dim=1)  # (batch_size * 2, hidden_size)
+                propmt_len = prompt_mask.sum(dim=1).unsqueeze(-1).clamp(min=1)  # (batch_size * 2, 1)
+                prompt_embedding = prompt_sum / propmt_len  # (batch_size * 2, hidden_size)
+
+                response_sum = (hidden_states_for_logps * response_mask.unsqueeze(-1)).sum(dim=1)  # (batch_size * 2, hidden_size)
+                response_len = response_mask.sum(dim=1).unsqueeze(-1).clamp(min=1)  # (batch_size * 2, 1)
+                response_embedding = response_sum / response_len  # (batch_size * 2, hidden_size)
+
+                prompt_response_input = torch.cat([prompt_embedding, response_embedding], dim=-1)  # (batch_size * 2, hidden_size * 2)
+                
+                if not self.config.loss.residual:
+                    all_betas = self.mlp(response_embedding.detach()).squeeze(-1)  # (batch_size * 2,)
+                else:
+                    all_betas = self.mlp(prompt_response_input.detach(), response_embedding.detach()).squeeze(-1)  # (batch_size * 2,)
+
                 chosen_betas = all_betas[:batch['chosen_input_ids'].shape[0]]
                 rejected_betas = all_betas[batch['chosen_input_ids'].shape[0]:]
 

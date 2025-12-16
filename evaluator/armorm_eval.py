@@ -92,23 +92,38 @@ def evaluate_armorm(output_path):
     for item in tqdm(dataset):
         # 1. 전체 대화(Prompt + Response)를 리스트로 변환
         prompt = item['prompt']
-        generated_response = item['generated_response']
+        generated_responses = item['generated_response']
         # item['rejected']는 Prompt + Rejected Response가 합쳐져 있음
-        generated_messages = parse_conversation(prompt + generated_response)              
+        if len(generated_responses) == 1:
+            generated_response = generated_responses[0]
+            generated_messages = parse_conversation(prompt + generated_response)
+            score = rm(generated_messages)[-1]
+            results.append({
+                "prompt": prompt, # 마지막 질문(Prompt)
+                "generated_response": generated_response, # Chosen 답변 앞부분
+                "reward": float(score),
+            })
+
+        else:
+            for generated_response in generated_responses:
+                generated_messages = parse_conversation(prompt + generated_response)
+                score = rm(generated_messages)[-1]
+                results.append({
+                    "prompt": prompt, # 마지막 질문(Prompt)
+                    "generated_response": generated_response, # Chosen 답변 앞부분
+                    "reward": float(score),
+                })
+
+
 
         # print(chosen_messages)
         # print('-'*50)
         # print(rejected_messages)
         # 2. 모델 점수 계산
         # rm 함수는 전체 리스트를 받아, '마지막 assistant 답변'에 대한 점수를 줍니다.
-        score = rm(generated_messages)[-1]
 
         # 3. 결과 저장 (검증을 위해 마지막 답변 텍스트도 같이 저장)
-        results.append({
-            "prompt": prompt, # 마지막 질문(Prompt)
-            "generated_response": generated_response, # Chosen 답변 앞부분
-            "reward": float(score),
-        })
+        
 
     # --- [5. 결과 출력] ---
     df = pd.DataFrame(results)
@@ -117,6 +132,7 @@ def evaluate_armorm(output_path):
     pd.set_option('display.max_colwidth', 50)
     print(df[['prompt', 'generated_response', 'reward']])
 
+    # save_path = os.path.join(os.path.dirname(output_path), 'armorm_eval.csv')
     save_path = os.path.join(os.path.dirname(output_path), 'armorm_eval.csv')
     df.to_csv(save_path, index=False, encoding="utf-8-sig")
 

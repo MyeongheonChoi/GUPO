@@ -48,7 +48,16 @@ def main(args):
 
     config_dir = os.path.join(parent_dir, "config.yaml")
     config = OmegaConf.load(config_dir)
+    
+    if OmegaConf.select(config, "loss.residual") is not None:
+        pass 
 
+    else:
+        if "residual" in config.exp_name:
+            config.loss.residual = True
+        else:
+            config.loss.residual = False
+                
     print('building policy base model')
     model_kwargs = {}
 

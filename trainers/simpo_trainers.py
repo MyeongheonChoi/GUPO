@@ -29,38 +29,29 @@ import functools
 from typing import Optional, Dict, List, Union, Tuple
 
 
-def dpo_loss(policy_chosen_logps: torch.FloatTensor,
+def simpo_loss(policy_chosen_logps: torch.FloatTensor,
              policy_rejected_logps: torch.FloatTensor,
-             reference_chosen_logps: torch.FloatTensor,
-             reference_rejected_logps: torch.FloatTensor,
              beta: float,
-             reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the DPO loss for a batch of policy and reference model log probabilities.
+             gamma_beta_ratio: float) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    """Compute the SimPO loss for a batch of policy model log probabilities.
     
     Args:
         policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
         policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-        reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-        reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
+        beta: The beta factor in SimPO loss.
+        gamma_beta_ratio: The ratio between the target reward margin (gamma) and beta in SimPO loss.
 
     Returns:
         A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
+        The losses tensor contains the SimPO loss for each example in the batch.
         The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
     """
     pi_logratios = policy_chosen_logps - policy_rejected_logps
-    ref_logratios = reference_chosen_logps - reference_rejected_logps
-
-    if reference_free:
-        ref_logratios = 0
-
-    logits = pi_logratios - ref_logratios
+    logits = pi_logratios - gamma_beta_ratio
 
     losses = -F.logsigmoid(beta * logits)
-    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
-    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
+    chosen_rewards = beta * policy_chosen_logps.detach()
+    rejected_rewards = beta * policy_rejected_logps.detach()
 
     return losses, chosen_rewards, rejected_rewards
 
@@ -120,9 +111,9 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
     return concatenated_batch
 
 
-class BasicTrainer(object):
+class SimPOTrainer(object):
     def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
-        """A trainer for a language model, supporting either SFT or DPO training.
+        """A trainer for a language model, supporting SimPO training.
            
            If multiple GPUs are present, naively splits the model across them, effectively
            offering N times available memory, but without any parallel computation.
@@ -175,29 +166,21 @@ class BasicTrainer(object):
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
         
-        if config.loss.name == 'dpo':
-            self._loss_fn = dpo_loss
+        if config.loss.name == 'simpo':
+            self._loss_fn = simpo_loss
             
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
-        """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
+        """Generate samples from the policy for the given batch of inputs."""
 
         policy_output = self.policy.generate(
             batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
-        if self.config.loss.name == 'dpo':
-            reference_output = self.reference_model.generate(
-                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
         policy_output = pad_to_length(policy_output, self.config.max_length, self.tokenizer.pad_token_id)
         policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
-        if self.config.loss.name == 'dpo':
-            reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
-            reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
-            reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
-        else:
-            reference_output_decoded = []
+        reference_output_decoded = []
 
         return policy_output_decoded, reference_output_decoded
     
@@ -210,46 +193,35 @@ class BasicTrainer(object):
         
         with torch.autocast(device_type='cuda', dtype=self.autocast_dtype, enabled=self.autocast_enabled):
             all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
+            all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=True)
             chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
             rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
             return chosen_logps, rejected_logps
 
 
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
-        """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
+        """Compute the SimPO loss and other metrics for the given batch of inputs."""
 
         metrics = {}
         train_test = 'train' if train else 'eval'
 
-        if loss_config.name == 'dpo':
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
-            with torch.no_grad():
-                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
+        policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
 
-            # losses, chosen_rewards, rejected_rewards = dpo_loss(
-            #     policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=loss_config.beta, reference_free=loss_config.reference_free)
-            losses, chosen_rewards, rejected_rewards = self._loss_fn(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, beta=loss_config.beta, reference_free=loss_config.reference_free)
-            reward_accuracies = (chosen_rewards > rejected_rewards).float()
+        losses, chosen_rewards, rejected_rewards = self._loss_fn(
+            policy_chosen_logps, policy_rejected_logps, beta=loss_config.beta, gamma_beta_ratio=loss_config.gamma_beta_ratio)
+        reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
-            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
-            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
-            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
+        chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
+        rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
+        reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
 
-            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+        metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
+        metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
+        metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
+        metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
 
-            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
-            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
-
-        elif loss_config.name == 'sft':
-            policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
-            policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False)
-
-            losses = -policy_chosen_logps
+        policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
+        metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
         policy_chosen_logps = all_gather_if_needed(policy_chosen_logps.detach(), self.rank, self.world_size)
         metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
@@ -260,7 +232,7 @@ class BasicTrainer(object):
         return losses.mean(), metrics
 
     def train(self):
-        """Begin either SFT or DPO training, with periodic evaluation."""
+        """Begin either SimPO training, with periodic evaluation."""
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
@@ -294,9 +266,6 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name == 'dpo':
-            self.reference_model.eval()
-
         self.example_counter = 0
         self.batch_counter = 0
         last_log = None
@@ -325,8 +294,6 @@ class BasicTrainer(object):
                     if self.config.sample_during_eval:
                         all_policy_samples, all_reference_samples = [], []
                         policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                        if self.config.loss.name == 'dpo':
-                            reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                     for eval_batch in (tqdm.tqdm(self.eval_batches) if self.rank == 0 else self.eval_batches):
                         local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
@@ -344,24 +311,17 @@ class BasicTrainer(object):
 
                             for prompt, sample in zip(eval_batch['prompt'], policy_samples):
                                 policy_text_table.add_data(self.example_counter, prompt, sample)
-                            if self.config.loss.name == 'dpo':
-                                for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                    reference_text_table.add_data(self.example_counter, prompt, sample)
 
                     mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
                     rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
                     if self.config.sample_during_eval:                    
                         rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                        if self.config.loss.name == 'dpo':
-                            rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
                     if self.config.wandb.enabled and self.rank == 0:
                         wandb.log(mean_eval_metrics, step=self.example_counter)
 
                         if self.config.sample_during_eval:
                             wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                            if self.config.loss.name == 'dpo':
-                                wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
                     if self.example_counter > 0:
                         output_dir = os.path.join(self.run_dir, f'step-{self.example_counter}')
@@ -454,18 +414,15 @@ class BasicTrainer(object):
                 chosen_logps, rejected_logps = self.concatenated_forward(
                     self.policy, local_eval_batch
                 )
-                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(
-                    self.reference_model, local_eval_batch
-                )
-            pi_logratios = chosen_logps - rejected_logps
-            ref_logratios = reference_chosen_logps - reference_rejected_logps
 
-            logits = pi_logratios - ref_logratios
+            pi_logratios = chosen_logps - rejected_logps
+
+            logits = pi_logratios - self.config.loss.gamma_beta_ratio
             beta = self.config.loss.beta
             prob = F.sigmoid(beta * logits)
             
-            chosen_rewards = beta * (chosen_logps - reference_chosen_logps).detach()
-            rejected_rewards = beta * (rejected_logps - reference_rejected_logps).detach()
+            chosen_rewards = beta * chosen_logps.detach()
+            rejected_rewards = beta * rejected_logps.detach()
             
             reward_margin = chosen_rewards - rejected_rewards
 

@@ -12,8 +12,6 @@ from utils.convert_to_hf import prepare_weights_for_vllm
 
 
 def main(args):
-    # 1. 학습 Config 로드
-    # 사용자가 입력한 체크포인트 경로를 절대 경로로 변환
     checkpoint_dir = os.path.abspath(args.checkpoint_dir)
     if not os.path.exists(checkpoint_dir):
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
@@ -21,10 +19,17 @@ def main(args):
     parent_dir = os.path.dirname(checkpoint_dir)
     config_dir = os.path.join(parent_dir, "config.yaml")
     config = OmegaConf.load(config_dir)
+    
+    if OmegaConf.select(config, "loss.residual") is not None:
+        pass 
+
+    else:
+        if "residual" in config.exp_name:
+            config.loss.residual = True
+        else:
+            config.loss.residual = False
 
     print("🔍 Checking and preparing model weights...")
-    # 이 함수 안에서도 config를 읽긴 하지만, 
-    # vLLM이 읽을 최종 경로(merged or adapter)를 얻기 위해 호출합니다.
     model_path, use_lora, lora_path = prepare_weights_for_vllm(checkpoint_dir)
     print(f"🚀 Initializing vLLM Engine")
     print(f"   - Base Model: {model_path}")
@@ -35,10 +40,9 @@ def main(args):
         dtype="bfloat16",
         seed=config.seed,
         gpu_memory_utilization=0.9,
-        max_model_len=args.max_len if args.max_len else config.model.get('max_length', 2048), # Config 없으면 args 사용
+        max_model_len=args.max_len if args.max_len else config.model.get('max_length', 2048),
     )
     stop_words = ["\nHuman:", "\n\nHuman:", "Human:", "\nUser:", "\n\nUser:"]
-    # 샘플링 파라미터 (생성 시에만 쓰이는 설정이므로 args로 받음)
     sampling_params = SamplingParams(
         n=args.n_samples,
         temperature=args.temperature,
@@ -55,16 +59,18 @@ def main(args):
         print(f"✅ LoRA Adapter will be applied from: {lora_path}")
         lora_request = LoRARequest("gupo_adapter", 1, lora_path)
 
-    # ------------------------------------------------------------------
-    # 3. 테스트 데이터셋 로드 (생성 대상)
-    # ------------------------------------------------------------------
-    dataset_name = args.dataset_name or config.datasets[0] # args가 없으면 학습 데이터셋 사용 (선택)
+    dataset_name = args.dataset_name or config.datasets[0] 
     print(f"📂 Loading dataset: {dataset_name} (split: {args.split})")
     
     if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
         dataset = load_dataset("json", data_files=dataset_name, split=args.split, data_dir='harmless-base')
     else:
         dataset = load_dataset(dataset_name, split=args.split, data_dir='harmless-base')
+        
+    # if dataset_name.endswith(".json") or dataset_name.endswith(".jsonl"):
+    #     dataset = load_dataset("json", data_files=dataset_name, split=args.split)
+    # else:
+    #     dataset = load_dataset(dataset_name, split=args.split)
 
     # 프롬프트 컬럼 찾기
     prompts = []
@@ -78,12 +84,9 @@ def main(args):
     #     else: raise ValueError(f"Dataset columns {dataset.column_names} do not contain '{prompt_col}' key.")
             
     # prompts = dataset[prompt_col]
-
+    
     print(f"📊 Total samples to generate: {len(prompts)}")
 
-    # ------------------------------------------------------------------
-    # 4. 문장 생성 & 저장
-    # ------------------------------------------------------------------
     print("⚡ Starting generation...")
     outputs = llm.generate(
         prompts, 
@@ -93,16 +96,21 @@ def main(args):
 
     results = []
     for output in outputs:
+        # results.append({
+        #     "prompt": output.prompt,
+        #     "generated_response": output.outputs[0].text
+        # })
         results.append({
             "prompt": output.prompt,
-            "generated_response": output.outputs[0].text
-        })
-
-    # 저장 경로: 체크포인트 폴더 안에 'generation_result.jsonl'로 저장
+            "generated_response": [output.outputs[i].text for i in range(len(output.outputs))],
+        })    
+    
     if args.output_file:
         output_path = args.output_file
     else:
         output_path = os.path.join(checkpoint_dir, "generation_result.jsonl")
+        # output_path = os.path.join(checkpoint_dir, "generation_result_full.jsonl")
+        # output_path = os.path.join(checkpoint_dir, "generation_result_3.jsonl")
 
     print(f"💾 Saving results to {output_path}...")
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -114,15 +122,12 @@ def main(args):
     
     print(f"⚙️ Saving generation config to {config_save_path}...")
     
-    # args 객체를 딕셔너리로 변환하여 저장
     generation_config = vars(args)
     
-    # (선택 사항) 보기 좋게 저장된 절대 경로들도 추가해주면 좋습니다
     generation_config['saved_checkpoint_dir_abs'] = checkpoint_dir
     
     with open(config_save_path, 'w', encoding='utf-8') as f:
         json.dump(generation_config, f, indent=4, ensure_ascii=False)
-    # ▲▲▲ 설정 저장 완료 ▲▲▲
 
     print("✅ Generation complete!")
 
@@ -130,22 +135,18 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate responses using vLLM with trained config")
     
-    # 필수: 체크포인트 경로 (여기에 config.yaml과 adapter 폴더가 있어야 함)
     parser.add_argument("--checkpoint_dir", type=str, required=True, help="Path to the checkpoint directory (e.g., outputs/exp/step-1000)")
     
-    # 선택: 데이터셋 (지정 안 하면 config의 학습 데이터셋을 쓸 수도 있음)
     parser.add_argument("--dataset_name", type=str, default="Anthropic/hh-rlhf", help="Dataset to generate responses for")
     parser.add_argument("--split", type=str, default="test", help="Dataset split")
     parser.add_argument("--prompt_column", type=str, default="prompt", help="Column name for prompts")
     
-    # 선택: 생성 파라미터
     parser.add_argument("--n_samples", type=int, default=1, help="Number of samples to generate per prompt")
     parser.add_argument("--max_len", type=int, default=None, help="Max context length (default: use config or 2048)")
     parser.add_argument("--max_new_tokens", type=int, default=512, help="Max new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
     parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling top-p")
     
-    # 선택: 출력 파일명 (기본값: checkpoint_dir/generation_result.jsonl)
     parser.add_argument("--output_file", type=str, default=None, help="Custom output file path")
 
     args = parser.parse_args()
