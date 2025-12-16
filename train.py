@@ -16,6 +16,7 @@ from omegaconf import OmegaConf, DictConfig
 
 from trainers.dpo_trainers import BasicTrainer
 from trainers.gupo_trainers import GUPOTrainer
+from trainers.alphadpo_trainers import AlphaDPOTrainer
 
 import wandb
 import json
@@ -42,6 +43,8 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Modul
         TrainerClass = BasicTrainer
     elif config.loss.name == 'gupo':
         TrainerClass = GUPOTrainer
+    elif config.loss.name == 'alphadpo':
+        TrainerClass = AlphaDPOTrainer
     elif config.loss.name == 'sft':
         TrainerClass = BasicTrainer
     else:
@@ -126,7 +129,7 @@ def main(config: DictConfig):
     
     disable_dropout(policy)
 
-    if config.loss.name == 'dpo' or config.loss.name == 'gupo':
+    if config.loss.name == 'dpo' or config.loss.name == 'gupo' or config.loss.name == 'alphadpo':
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -148,6 +151,8 @@ def main(config: DictConfig):
         if config.loss.name == 'dpo':
             reference_model.load_state_dict(state_dict['state'])
         if config.loss.name == 'gupo':
+            reference_model.load_state_dict(state_dict['state'])
+        if config.loss.name == 'alphadpo':
             reference_model.load_state_dict(state_dict['state'])
         print('loaded pre-trained weights')
     
