@@ -96,52 +96,6 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
 
     return data
 
-def get_hh_dr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
-    """Load the Anthropic Helpful-Harmless dataset from Huggingface and convert it to the necessary format.
-    
-       The dataset is converted to a dictionary with the following structure:
-       {
-           'prompt1': {
-               'responses': List[str],
-               'pairs': List[Tuple[int, int]],
-               'sft_target': str
-           },
-           'prompt2': {
-               ...
-           },
-       }
-
-       Prompts should be structured as follows:
-         \n\nHuman: <prompt>\n\nAssistant:
-       Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
-       
-       For this dataset, the sft_target is just the chosen response.
-    """
-    print(f'Loading HH dataset ({split} split) from Huggingface...')
-    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
-    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir, data_dir = 'harmless-base')
-    dataset = datasets.load_from_disk('./harmless-base-with-reward')[split]
-    print('done')
-
-    def split_prompt_and_responses(ex):
-        prompt = extract_anthropic_prompt(ex['chosen'])
-        chosen_response = ex['chosen'][len(prompt):]
-        rejected_response = ex['rejected'][len(prompt):]
-        reward_margin = ex['reward_margin']
-        return prompt, chosen_response, rejected_response, reward_margin
-
-    data = defaultdict(lambda: defaultdict(list))
-    for row in tqdm.tqdm(dataset, desc='Processing HH', disable=silent):
-        prompt, chosen, rejected, reward_margin = split_prompt_and_responses(row)
-        responses = [chosen, rejected]
-        n_responses = len(data[prompt]['responses'])
-        data[prompt]['pairs'].append((n_responses, n_responses + 1))
-        data[prompt]['responses'].extend(responses)
-        data[prompt]['sft_target'] = chosen
-        data[prompt]['reward_margin'] = reward_margin
-
-    return data
-
 
 def get_imdb(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the Anthropic Helpful-Harmless dataset from Huggingface and convert it to the necessary format.
