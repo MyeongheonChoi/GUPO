@@ -75,9 +75,8 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
        For this dataset, the sft_target is just the chosen response.
     """
     print(f'Loading HH dataset ({split} split) from Huggingface...')
-    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
-    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir, data_dir = 'harmless-base')
     dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
+    #dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir, data_dir = 'harmless-base')
     print('done')
 
     def split_prompt_and_responses(ex):
@@ -94,6 +93,52 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
         data[prompt]['pairs'].append((n_responses, n_responses + 1))
         data[prompt]['responses'].extend(responses)
         data[prompt]['sft_target'] = chosen
+
+    return data
+
+def get_hh_dr(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
+    """Load the Anthropic Helpful-Harmless dataset from Huggingface and convert it to the necessary format.
+    
+       The dataset is converted to a dictionary with the following structure:
+       {
+           'prompt1': {
+               'responses': List[str],
+               'pairs': List[Tuple[int, int]],
+               'sft_target': str
+           },
+           'prompt2': {
+               ...
+           },
+       }
+
+       Prompts should be structured as follows:
+         \n\nHuman: <prompt>\n\nAssistant:
+       Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
+       
+       For this dataset, the sft_target is just the chosen response.
+    """
+    print(f'Loading HH dataset ({split} split) from Huggingface...')
+    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
+    # dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir, data_dir = 'harmless-base')
+    dataset = datasets.load_from_disk('./harmless-base-with-reward')[split]
+    print('done')
+
+    def split_prompt_and_responses(ex):
+        prompt = extract_anthropic_prompt(ex['chosen'])
+        chosen_response = ex['chosen'][len(prompt):]
+        rejected_response = ex['rejected'][len(prompt):]
+        reward_margin = ex['reward_margin']
+        return prompt, chosen_response, rejected_response, reward_margin
+
+    data = defaultdict(lambda: defaultdict(list))
+    for row in tqdm.tqdm(dataset, desc='Processing HH', disable=silent):
+        prompt, chosen, rejected, reward_margin = split_prompt_and_responses(row)
+        responses = [chosen, rejected]
+        n_responses = len(data[prompt]['responses'])
+        data[prompt]['pairs'].append((n_responses, n_responses + 1))
+        data[prompt]['responses'].extend(responses)
+        data[prompt]['sft_target'] = chosen
+        data[prompt]['reward_margin'] = reward_margin
 
     return data
 
@@ -127,6 +172,82 @@ def get_imdb(split: str, silent: bool = False, cache_dir: str = None) -> Dict[st
 
     return data
 
+def messages_to_prompt_and_response(messages: List[Dict[str, str]]) -> Tuple[str, str]:
+    assert isinstance(messages, list) and len(messages) > 0
+
+    last_asst_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            last_asst_idx = i
+            break
+    if last_asst_idx is None:
+        raise ValueError("No assistant message found in messages")
+
+    parts = []
+    for m in messages[:last_asst_idx]:
+        role = m.get("role")
+        content = (m.get("content") or "")
+        if role == "user":
+            parts.append("\n\nHuman: " + content)
+        elif role == "assistant":
+            parts.append("\n\nAssistant: " + content)
+        else:
+            continue
+
+    prompt = "".join(parts)
+    if not prompt.startswith("\n\nHuman:"):
+        prompt = "\n\nHuman:" + prompt
+
+    if not prompt.endswith("\n\nAssistant:"):
+        prompt = prompt + "\n\nAssistant:"
+
+    response = (messages[last_asst_idx].get("content") or "")
+
+    if len(response) > 0 and not response.startswith(" "):
+        response = " " + response
+    return prompt, response
+
+
+def get_uf(split: str, silent: bool = False, cache_dir: str = None):
+    """
+    HuggingFaceH4/ultrafeedback_binarized:
+      - train_prefs / test_prefs
+    """
+    if split == "train":
+        split = "train_prefs"
+    elif split == "test":
+        split = "test_prefs"
+    
+    print(f'Loading UltraFeedback Binarized dataset ({split} split) from Huggingface...')
+    dataset = datasets.load_dataset('HuggingFaceH4/ultrafeedback_binarized', split=split, cache_dir=cache_dir)
+    print('done')
+
+    data = defaultdict(lambda: defaultdict(list))
+
+    for row in tqdm.tqdm(dataset, desc=f'Processing UltraFeedback({split})', disable=silent):
+        if 'chosen' in row and 'rejected' in row:
+            prompt_c, chosen_resp = messages_to_prompt_and_response(row['chosen'])
+            prompt_r, rejected_resp = messages_to_prompt_and_response(row['rejected'])
+            
+            if prompt_c != prompt_r:
+                prompt = prompt_c
+            else:
+                prompt = prompt_c
+
+            responses = [chosen_resp, rejected_resp]
+            n_responses = len(data[prompt]['responses'])
+            data[prompt]['pairs'].append((n_responses, n_responses + 1))
+            data[prompt]['responses'].extend(responses)
+            data[prompt]['sft_target'] = chosen_resp
+
+        else:
+            prompt, resp = messages_to_prompt_and_response(row['messages'])
+            n_responses = len(data[prompt]['responses'])
+            data[prompt]['responses'].append(resp)
+            data[prompt]['pairs'] = data[prompt].get('pairs', [])
+            data[prompt]['sft_target'] = resp
+
+    return data
 
 def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None):
     """Load the given dataset by name. Supported by default are 'shp', 'hh', and 'se'."""
@@ -136,6 +257,8 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         data = get_hh(split, silent=silent, cache_dir=cache_dir)
     elif name == 'imdb':
         data = get_imdb(split, silent=silent, cache_dir=cache_dir)
+    elif name == 'uf':
+        data = get_uf(split, silent=silent, cache_dir=cache_dir)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
@@ -287,7 +410,7 @@ def get_batch_iterator(names: List[str],
         permutation_seeds = iter(np.random.randint(0, 2**32, size=1000000))
         flat_data = []
         for name in names:
-            truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
+            truncation_mode = 'keep_end' if name == ['hh', 'uf'] else 'keep_start'
             for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode))
 
@@ -340,7 +463,6 @@ def get_batch_iterator(names: List[str],
             break
 
         epoch_idx += 1
-
 
 def strings_match_up_to_spaces(str_a: str, str_b: str) -> bool:
     """Returns True if str_a and str_b match up to spaces, False otherwise."""
